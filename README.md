@@ -1,7 +1,3 @@
-# Email-Classification-ai
-
-Module for listing to a kafka topic and determing email is spam/ham. If email is Ham then classify into types(complaint/query/suggestions) and its sub types. Then publish to kafka topic.
-
 Remove docker images
 
     docker-compose down
@@ -16,20 +12,46 @@ Build with new code
 
 Remove old venv
 
-    rm -rf /Users/ranveersingh/Desktop/AI/email-classification-ai/venv
+    rm -rf venv
 
 Install Python
 
     brew install python@3.10
 
-Command for local execution
-
-    python3.10 -m venv /Users/ranveersingh/Desktop/AI/email-classification-ai/venv
-
 Activiate Env
 
-    source /Users/ranveersingh/Desktop/AI/email-classification-ai/venv/bin/activate
+    #can change the env names
+    python3.10 -m venv myvenv
+    source myvenv/bin/activate
 
-Install library
+    python --version
 
-    pip install -r requirements.txt
+Install library in local VM
+
+    #Required for kafka confluent
+    brew install librdkafka
+
+
+    pip install "numpy<2.0.0"  sentence-transformers torch elasticsearch confluent-kafka httpx aiohttp python-json-logger transformers python-dotenv nltk langdetect fastapi uvicorn gunicorn pydantic asyncio sentencepiece
+
+Start in local
+
+    python3.10 master.py
+
+deactivate your virtual environment if it's active:
+
+    deactivate
+
+Kafka email message for classification :
+
+    echo '{
+    "emailBody": "Hello, I need help with my profile details. Can I request deletion of my profile information stored at time of registration?",
+    "tenantId": "tenant123",
+    "threadId": "67890",
+    "department": "ecommerce",
+    "senderName": "John Doe"
+    }' | jq -c . | docker exec -i broker kafka-console-producer \
+    --bootstrap-server localhost:9092 \
+    --topic email.classification.ai.request \
+    --property "parse.key=false" \
+    --property "key.separator=,"

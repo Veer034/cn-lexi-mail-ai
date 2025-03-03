@@ -7,6 +7,10 @@
 # Virtual environment
 venv/
 .env/
+myvenv/
+__pycache__/
+final_model/
+spam_model/
 
 
 # VSCode

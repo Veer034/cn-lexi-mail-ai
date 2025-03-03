@@ -1,0 +1,418 @@
+[
+  {
+    "sector": "tourism_services",
+    "types": [
+      {
+        "type": "complaint",
+        "subTypes": [
+          "unmet_expectation_complaint",
+          "safety_concern_complaint",
+          "poor_customer_service_complaint",
+          "over_crowded_complaint",
+          "billing_issue_complaint",
+          "inadequate_facility_complaint",
+          "difficulty_booking_cancellation_complaint",
+          "misleading_tour_description_complaint",
+          "poor_tour_guide_performance_complaint",
+          "delayed_canceled_tour_complaint"
+        ]
+      },
+      {
+        "type": "query",
+        "subTypes": [
+          "group_discount_query",
+          "itinerary_detail_query",
+          "tour_availability_query",
+          "transportation_arrangement_query",
+          "cancellation_policy_query",
+          "local_guide_information_query",
+          "special_arrangement_query",
+          "payment_option_query",
+          "pricing_package_query",
+          "safety_measure_query"
+        ]
+      },
+      {
+        "type": "suggestion",
+        "subTypes": [
+          "loyalty_reward_suggestion",
+          "enhanced_safety_protocol_suggestion",
+          "flexible_scheduling_suggestion",
+          "dinning_experience_suggestion",
+          "cultural_activity_suggestion",
+          "better_communication_suggestion",
+          "expanded_package_suggestion",
+          "improved_guide_training_suggestion",
+          "new_tour_offering_suggestion",
+          "eco_friendly_suggestion"
+        ]
+      }
+    ]
+  },
+  {
+    "sector": "hospitality_and_accommodation",
+    "types": [
+      {
+        "type": "complaint",
+        "subTypes": [
+          "billing_error_complaint",
+          "quality_amenity_complaint",
+          "reservation_complaint",
+          "room_cleanliness_complaint",
+          "security_complaint",
+          "poor_customer_service_complaint",
+          "noise_disturbance_complaint",
+          "unfulfilled_special_request_complaint",
+          "inaccurate_information_complaint",
+          "maintenance_complaint"
+        ]
+      },
+      {
+        "type": "query",
+        "subTypes": [
+          "transportation_parking_query",
+          "amenity_service_query",
+          "event_conference_facility_query",
+          "reservation_modification_query",
+          "check-in_check-out_time_query",
+          "cancellation_policy_query",
+          "payment_method_query",
+          "pricing_discount_query",
+          "special_request_query",
+          "room_availability_query"
+        ]
+      },
+      {
+        "type": "suggestion",
+        "subTypes": [
+          "entertainment_suggestion",
+          "customer_service_training_suggestion",
+          "room_feature_suggestion",
+          "booking_process_suggestion",
+          "enhanced_dining_suggestion",
+          "eco-friendly_practice_suggestion",
+          "facility_suggestion",
+          "loyalty_program_suggestion",
+          "service_enhancement_suggestion"
+        ]
+      }
+    ]
+  },
+  {
+    "sector": "health_insurance",
+    "types": [
+      {
+        "type": "complaint",
+        "subTypes": [
+          "customer_service_complaint",
+          "renewal_complaint",
+          "claim_denial_complaint",
+          "hospital_network_complaint",
+          "access_information_complaint",
+          "payment_delay_complaint",
+          "billing_complaint",
+          "coverage_dispute_complaint",
+          "policy_miscommunication_complaint"
+        ]
+      },
+      {
+        "type": "query",
+        "subTypes": [
+          "document_query",
+          "policy_coverage_query",
+          "claim_process_query",
+          "network_provider_query",
+          "policy_change_query",
+          "premium_payment_query",
+          "benefit_discount_query",
+          "coverage_specific_treatment_query",
+          "policy_renewal_query"
+        ]
+      },
+      {
+        "type": "suggestion",
+        "subTypes": [
+          "expanded_coverage_suggestion",
+          "claim_process_suggestion",
+          "network_expansion_suggestion",
+          "enhanced_digital_service_suggestion",
+          "wellness_program_suggestion",
+          "increased_transparency_suggestion",
+          "feedback_mechanism_suggestion",
+          "improved_communication_suggestion",
+          "payment_option_suggestion",
+          "customer_service_suggestion"
+        ]
+      }
+    ]
+  },
+  {
+    "sector": "digital_healthcare",
+    "types": [
+      {
+        "type": "complaint",
+        "subTypes": [
+          "data_privacy_complaint",
+          "incorrect_health_information_complaint",
+          "compatibility_complaint",
+          "feature_complaint",
+          "subscription_complaint",
+          "billing_complaint",
+          "app_malfunction_complaint",
+          "poor_customer_support_complaint",
+          "usability_complaint",
+          "account_login_complaint"
+        ]
+      },
+      {
+        "type": "query",
+        "subTypes": [
+          "health_data_query",
+          "compatibility_query",
+          "account_query",
+          "technical_support_query",
+          "general_information_query",
+          "feature_usage_query",
+          "subscription_billing_query",
+          "app_functionality_query"
+        ]
+      },
+      {
+        "type": "suggestion",
+        "subTypes": [
+          "health_resource_suggestion",
+          "feature_enhancement_suggestion",
+          "data_security_suggestion",
+          "regular_update_suggestion",
+          "compatibility_suggestion",
+          "subscription_option_suggestion",
+          "user_experience_improvement_suggestion",
+          "customer_support_suggestion",
+          "health_tracking_suggestion"
+        ]
+      }
+    ]
+  },
+  {
+    "sector": "retail",
+    "types": [
+      {
+        "type": "complaint",
+        "subTypes": [
+          "store_condition_complaint",
+          "checkout_complaint",
+          "product_placement_complaint",
+          "in_store_return_complaint",
+          "staff_service_complaint"
+        ]
+      },
+      {
+        "type": "query",
+        "subTypes": [
+          "event_query",
+          "in_store_safety_query",
+          "store_query",
+          "in_store_service_query",
+          "in_store_availability_query"
+        ]
+      },
+      {
+        "type": "suggestion",
+        "subTypes": [
+          "in_store_technology_suggestion",
+          "health_suggestion",
+          "staff_training_suggestion",
+          "store_layout_suggestion"
+        ]
+      }
+    ]
+  },
+  {
+    "sector": "travel_and_transportation",
+    "types": [
+      {
+        "type": "complaint",
+        "subTypes": [
+          "delay_cancellation_complaint",
+          "refund_compensation_complaint",
+          "lost_damaged_baggage_complaint",
+          "miscommunication_complaint",
+          "cleanliness_hygiene_complaint",
+          "poor_customer_service_complaint",
+          "safety_security_complaint",
+          "overbooking_complaint",
+          "onboard_facility_complaint",
+          "inaccurate_information_complaint"
+        ]
+      },
+      {
+        "type": "query",
+        "subTypes": [
+          "ticket_price_discount_query",
+          "special_assistance_request_query",
+          "visa_passport_query",
+          "baggage_policy_query",
+          "payment_method_query",
+          "booking_reservation_query",
+          "travel_insurance_query",
+          "travel_schedule_query",
+          "loyalty_program_query",
+          "seat_selection_upgrade_query"
+        ]
+      },
+      {
+        "type": "suggestion",
+        "subTypes": [
+          "additional_amenity_suggestion",
+          "improved_customer_service_suggestion",
+          "service_improvement_suggestion",
+          "loyalty_program_enhancement_suggestion",
+          "enhanced_meal_suggestion",
+          "new_routes_destination_suggestion",
+          "eco-friendly_practice_suggestion",
+          "comfortable_seating_suggestion",
+          "check-in_process_suggestion"
+        ]
+      }
+    ]
+  },
+  {
+    "sector": "it",
+    "types": [
+      {
+        "type": "complaint",
+        "subTypes": [
+          "data_privacy_complaint",
+          "account_access_complaint",
+          "performance_complaint",
+          "usability_ui_complaint",
+          "feature_limitation_complaint",
+          "integration_complaint",
+          "language_localization_complaint",
+          "technical_complaint",
+          "update_complaint",
+          "customer_support_complaint",
+          "billing_subscription_complaint"
+        ]
+      },
+      {
+        "type": "query",
+        "subTypes": [
+          "security_query",
+          "account_subscription_query",
+          "data_security_query",
+          "api_integration",
+          "updates_query",
+          "performance_query",
+          "installation",
+          "feature_usage_query",
+          "license_activation_query"
+        ]
+      },
+      {
+        "type": "suggestion",
+        "subTypes": [
+          "localization_suggestion",
+          "documentation_suggestion",
+          "security_suggestion",
+          "ui_ux_suggestion",
+          "price_license_suggestion",
+          "integration_suggestion",
+          "feedback_mechanism_suggestion",
+          "analytics_suggestion",
+          "performance_suggestion"
+        ]
+      }
+    ]
+  },
+  {
+    "sector": "hospitals_and_healthcare",
+    "types": [
+      {
+        "type": "complaint",
+        "subTypes": [
+          "facility_cleanliness_complaint",
+          "poor_communication_complaint",
+          "staff_complaint",
+          "billing_complaint",
+          "insurance_billing_dispute_complaint",
+          "appointment_complaint",
+          "lack_follow-up_care_complaint",
+          "medical_complaint",
+          "long_wait_complaint"
+        ]
+      },
+      {
+        "type": "query",
+        "subTypes": [
+          "insurance_billing_query",
+          "procedure_detail_query",
+          "doctor_availability_query",
+          "referral_specialist_consultation_query",
+          "appointment_scheduling_query",
+          "visitation_policy_query",
+          "medication_information_query",
+          "facility_service_query",
+          "test_result_query",
+          "medical_record_query"
+        ]
+      },
+      {
+        "type": "suggestion",
+        "subTypes": [
+          "pain_management_suggestion",
+          "food_service_suggestion",
+          "recreational_activity_suggestion",
+          "facility_suggestion",
+          "enhanced_privacy_suggestion",
+          "staff_training_suggestion",
+          "appointment_scheduling_suggestion",
+          "follow-up_care_suggestion",
+          "environmental_sustainability_suggestion",
+          "communication_suggestion"
+        ]
+      }
+    ]
+  },
+  {
+    "sector": "ecommerce",
+    "types": [
+      {
+        "type": "complaint",
+        "subTypes": [
+          "technical_issue",
+          "customer_service_issue",
+          "product_issue",
+          "return_exchange_issue",
+          "payment_issue",
+          "fraud_issue",
+          "delivery_issue"
+        ]
+      },
+      {
+        "type": "query",
+        "subTypes": [
+          "discount_query",
+          "product_specification_query",
+          "order_status_query",
+          "return_policy_query",
+          "shipping_duration_query",
+          "account_management_query",
+          "product_availability_query"
+        ]
+      },
+      {
+        "type": "suggestion",
+        "subTypes": [
+          "service_improvement_suggestion",
+          "payment_suggestion",
+          "product_suggestion",
+          "feature_enhancement_suggestion",
+          "sustainability_initiative_suggestion",
+          "mobile_app_suggestion",
+          "shipping_suggestion"
+        ]
+      }
+    ]
+  }
+]
