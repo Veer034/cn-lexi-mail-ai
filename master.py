@@ -477,10 +477,10 @@ class MultilingualMessageProcessor:
             # Extract all questions from the email
             query_response = await self.query_processor.generate_query_responses(tenant_id,thread_id,sender_name,content, language,type,subtype)
             if query_response:
-                content = query_response.get("message", {}).get("content", "No answer found")
+                response_content = query_response.get("message", {}).get("content", "No answer found")
 
                 if content:
-                    classification = EmailClassificationDto(tenantId=tenant_id, threadId=thread_id, type=type, subType=subtype, query=content)
+                    classification = EmailClassificationDto(tenantId=tenant_id, threadId=thread_id, type=type, subType=subtype, queryResponse=response_content)
 
                 else:
                     classification = EmailClassificationDto(tenantId=tenant_id, threadId=thread_id,type=type, subType=subtype)

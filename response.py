@@ -16,7 +16,7 @@ class EmailClassificationDto(BaseModel):
     threadId: str
     type: str
     subType: str
-    query: Optional[str] = None
+    queryResponse: Optional[str] = None
     complaints: Optional[List[Complaint]] = None
     suggestions: Optional[List[str]] = None
     eventTime: int = Field(default_factory=lambda: int(datetime.datetime.now(datetime.timezone.utc).timestamp() * 1000))
