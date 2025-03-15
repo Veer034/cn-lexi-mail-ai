@@ -14,12 +14,12 @@ KAFKA_CONFIG = {
 
 ES_CONFIG = {
     'hosts': os.getenv('ES_HOSTS', 'http://localhost:9200'),
-    'index_name': os.getenv('ES_INDEX_NAME', 'messages')
+    'index_name': os.getenv('ES_INDEX_NAME', 'tenant-documents-vector')
 }
 
 
 MISTRAL_CONFIG = {
     'service_url': os.getenv('MISTRAL_SERVICE_URL', 'http://localhost:11434/api/chat'),
     'model': os.getenv('MISTRAL_MODEL', 'mistral'),
-    'timeout': 120,
+    'timeout': 240,
 }

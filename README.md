@@ -44,13 +44,7 @@ deactivate your virtual environment if it's active:
 
 Kafka email message for classification :
 
-    echo '{
-    "emailBody": "Hello, I need help with my profile details. Can I request deletion of my profile information stored at time of registration?",
-    "tenantId": "tenant123",
-    "threadId": "67890",
-    "department": "ecommerce",
-    "senderName": "John Doe"
-    }' | jq -c . | docker exec -i broker kafka-console-producer \
+    echo '{"tenantId": "fc569170-7573-428a-9333-eced51b1d712", "department": "ecommerce", "threadId": "1957fee209276d10","messageId": "79138fd0-d24a-4f23-bc22-66f065eb91fc", "subject": "Return order number 100011034", "emailBody": "Hi Team, I purchased an order from your website. And it turns out to be very bad. I want to return it, which I purchased on 01/01/20235. My order number is 100011034 I want details to return, and contact details. -- Ranveer Singh 8884524333", "senderName": "Ranveersingh"}' | jq -c . | docker exec -i broker kafka-console-producer \
     --bootstrap-server localhost:9092 \
     --topic email.classification.ai.request \
     --property "parse.key=false" \

@@ -116,6 +116,7 @@ class EmailClassifier:
             with torch.no_grad():
                 outputs = self.spam_model(**inputs)
             prediction = torch.argmax(outputs.logits, dim=1).item()
+            logging.info(f" prediction {prediction}")
             return self.spam_label_map.get(prediction, "unknown")
         except Exception as e:
             logger.error(f"Error in spam classification: {e}")
@@ -155,16 +156,16 @@ class EmailClassifier:
             logger.error(f"Error in type/subtype classification: {e}")
             return "unknown", None
     
-    async def process_emails(self, department, emailBody):
+    async def process_emails(self, complete_content, department):
         """Process an email to determine its type and subtype"""
         try:
-            logger.info(f"Processing email: {emailBody}")
-            label = self.classify_spam(emailBody)
+            logger.info(f"Processing email: {complete_content}")
+            label = self.classify_spam(complete_content)
             if label in ["spam"]:
                 type_result = label
                 subtype_result = ""
             else:
-                type_result, subtype_result = self.classify_type_subtype(emailBody, department)
+                type_result, subtype_result = self.classify_type_subtype(complete_content, department)
             
             return type_result, subtype_result
         except Exception as e:

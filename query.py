@@ -368,7 +368,7 @@ class QueryProcessor:
         """
         try:
             # Build the filter conditions - tenant_id is required
-            filter_conditions = [{"term": {"tenant_id": tenant_id}}]
+            filter_conditions = [{"term": {"tenantId": tenant_id}}]
             
             # Add metadata filters if provided
             if metadata_filters:
@@ -388,7 +388,7 @@ class QueryProcessor:
                             }
                         },
                         "script": {
-                            "source": "cosineSimilarity(params.query_vector, 'content_vector')",
+                            "source": "cosineSimilarity(params.query_vector, 'contentVector')",
                             "params": {"query_vector": embedding}
                         }
                     }

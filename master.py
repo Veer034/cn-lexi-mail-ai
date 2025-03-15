@@ -187,7 +187,16 @@ class MultilingualMessageProcessor:
 
         # Serialize key and value
         serialized_key = str(tenant_id).encode("utf-8")  # Convert tenant_id to bytes
-        serialized_classification = json.dumps(classification).encode("utf-8")
+        # Convert Pydantic model to dict first, then to JSON string
+        # Use model_dump() instead of dict() for Pydantic v2 compatibility
+        try:
+            # Try the new Pydantic v2 method first
+            data = classification.model_dump()
+        except AttributeError:
+            # Fall back to the old method for Pydantic v1
+            data = classification.dict()
+        
+        serialized_classification = json.dumps(data).encode("utf-8")
 
         # Create an asyncio Future to wait for delivery report
         future = asyncio.Future()
@@ -204,7 +213,7 @@ class MultilingualMessageProcessor:
         
         return await future
 
-    async def categorize_email_using_mistral(self, email_content: str, language: str, department: Optional[str] = None) -> Dict[str, str]:
+    async def categorize_email_using_mistral(self, email_content: str, language: str,  department: Optional[str] = None) -> Dict[str, str]:
         """
         Process an email with a balanced approach:
         1. First classify the email type/subtype
@@ -447,11 +456,29 @@ class MultilingualMessageProcessor:
 
         tenant_id = message.get('tenantId')
         thread_id = message.get('threadId')
-        department = message.get('department')
+        message_id = message.get('messageId')
+        department: Optional[str] = message.get('department')  # Declare type here
         sender_name = message.get('senderName')
         # Extract text content from message
-        content = message.get('emailBody')
-        if not content:
+        # Get content with fallback
+        content = message.get('emailBody') or ""
+        subject = message.get('subject') or ""
+        queryReplyGeneration = message.get('queryReplyGeneration') or False
+        autoComplaintTicketGeneration = message.get('autoComplaintTicketGeneration') or False
+
+
+
+        # Build complete_content intelligently
+        if subject and content:
+            complete_content = f"Subject: {subject}, Body: {content}"
+        elif subject :
+            complete_content = f"Subject: {subject}"
+        elif content:
+            complete_content = content
+        else:
+            complete_content =''
+
+        if not complete_content:
             logger.warning("Email Message has no content , tenantId : {tenant_id}, threadId: {thread_id} ")
             return
         
@@ -463,51 +490,84 @@ class MultilingualMessageProcessor:
             sender_name = self.extract_sender_name_multilingual(content,language)
 
 
+        complete_content = "Subject: "+subject +", Body: "+content
+
+
+        logging.info(f"language: {language} department: {department} , complete_content {complete_content}")
+
         if language == 'en' and department :
-            type,subtype = await self.email_classifier.process_emails(department,content);
+            type,subtype = await self.email_classifier.process_emails( content, department);
         else :
-            type,subtype = await self.categorize_email_using_mistral(content, language, department);
+            type,subtype = await self.categorize_email_using_mistral(complete_content, language, department);
 
 
         logger.info(f"Email Type: {type} , SubType: {subtype}")
 
-        classification;
+  
         if type == "query":
-            
-            # Extract all questions from the email
-            query_response = await self.query_processor.generate_query_responses(tenant_id,thread_id,sender_name,content, language,type,subtype)
-            if query_response:
-                response_content = query_response.get("message", {}).get("content", "No answer found")
 
-                if content:
-                    classification = EmailClassificationDto(tenantId=tenant_id, threadId=thread_id, type=type, subType=subtype, queryResponse=response_content)
+            # If query reply generation is not requed
+            if not queryReplyGeneration :
+                classification = EmailClassificationDto(tenantId=tenant_id, threadId=thread_id, messageId=message_id, type=type, subType=subtype)
+ 
+            else :
+          
+                # Extract all questions from the email
+                query_response = await self.query_processor.generate_query_responses(tenant_id,thread_id,sender_name,complete_content, language,type,subtype)
+                if query_response:
+                    response_content = query_response.get("message", {}).get("content", "No answer found")
+
+                    if content:
+                        classification = EmailClassificationDto(tenantId=tenant_id, threadId=thread_id, messageId=message_id, type=type, subType=subtype, queryResponse=response_content)
+
+                    else:
+                        classification = EmailClassificationDto(tenantId=tenant_id, threadId=thread_id, messageId=message_id, type=type, subType=subtype)
 
                 else:
-                    classification = EmailClassificationDto(tenantId=tenant_id, threadId=thread_id,type=type, subType=subtype)
-
-            else:
-                classification = EmailClassificationDto(tenantId=tenant_id, threadId=thread_id,type=type, subType=subtype)       
+                    classification = EmailClassificationDto(tenantId=tenant_id, threadId=thread_id, messageId=message_id, type=type, subType=subtype)       
         
         elif type == "complaint":
-            complaints_list = await self.complaint_extractor.extract_complaints(tenant_id,content, language)
-            complaints_objects = []
-            for complaint_data in complaints_list:
-                complaint_text = complaint_data["question"]
-                advices_list = [
-                    Advice(advice=advice["advice"], url=advice["url"]) for advice in complaint_data["advices"]
-                ]
-
-                complaints_objects.append(Complaint(complaint=complaint_text, advises=advices_list))
-
-            classification = EmailClassificationDto(tenantId=tenant_id, threadId=thread_id,type=type,subType=subtype,complaints=complaints_objects)
             
+            if not autoComplaintTicketGeneration:
+                classification = EmailClassificationDto(tenantId=tenant_id, threadId=thread_id, messageId=message_id, type=type, subType=subtype)
+ 
+            else :
+
+                complaint_list = await self.complaint_extractor.extract_complaints(tenant_id,complete_content, language)
+                logger.info(f" complaint_list {complaint_list}")
+                
+                if complaint_list:
+                    complaints = complaint_list['complaints']  
+
+                    # Create advice objects from the existing advices
+                    advices_list = [
+                        Advice(query = advice["query"], advice=advice["advice"], url=advice["url"]) 
+                        for advice in complaint_list["advices"]
+                    ]
+                
+                    
+                    # Create the complaint object directly using the question as is
+                    complaint_object = Complaint(
+                        complaints=complaints,  
+                        advises=advices_list
+                    )
+                    
+                    # Use this in your EmailClassificationDto
+                    classification = EmailClassificationDto(
+                        tenantId=tenant_id,
+                        threadId=thread_id,
+                        messageId=message_id,
+                        type=type,
+                        subType=subtype,
+                        complaint=complaint_object
+                    )
 
         elif type == "suggestion":
-            suggestion_list = await self.suggestion_extractor.extract_suggestions(content, type, subtype,department, language )
-            classification = EmailClassificationDto(tenantId=tenant_id, threadId=thread_id,type=type,subType=subtype,suggestions=suggestion_list)
+            suggestion_list = await self.suggestion_extractor.extract_suggestions(complete_content, type, subtype,department, language )
+            classification = EmailClassificationDto(tenantId=tenant_id, threadId=thread_id, messageId=message_id, type=type,subType=subtype,suggestions=suggestion_list)
 
         else:
-            classification = EmailClassificationDto(tenantId=tenant_id, threadId=thread_id, type="spam",subType="")
+            classification = EmailClassificationDto(tenantId=tenant_id, threadId=thread_id, messageId=message_id, type="spam",subType="")
 
 
       
@@ -584,7 +644,7 @@ class MultilingualMessageProcessor:
                 except Exception as e:
                     request_id = str(uuid.uuid4())
                     logger.error(f"Error requestId: {request_id} processing message: {str(e)}", exc_info=True)
-                    await self.send_to_dead_letter_queue(value, str(e))
+                    await self.send_to_dead_letter_queue(request_id,value, str(e))
                     
         except KeyboardInterrupt:
             pass
