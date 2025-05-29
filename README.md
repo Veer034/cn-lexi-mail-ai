@@ -1,3 +1,7 @@
+About
+
+    LexiMail AI is an advanced GenAI-powered email assistant designed to understand, classify, and generate intelligent responses for incoming emails. Whether it's queries, complaints, or suggestions, LexiMail AI ensures quick, accurate, and context-aware replies, seamlessly integrating with your workflow.
+
 Remove docker images
 
     docker-compose down
@@ -31,8 +35,7 @@ Install library in local VM
     #Required for kafka confluent
     brew install librdkafka
 
-
-    pip install "numpy<2.0.0"  sentence-transformers torch elasticsearch confluent-kafka httpx aiohttp python-json-logger transformers python-dotenv nltk langdetect fastapi uvicorn gunicorn pydantic asyncio sentencepiece
+    pip install "numpy<2.0.0"  sentence-transformers torch elasticsearch confluent-kafka httpx aiohttp python-json-logger transformers python-dotenv nltk langdetect fastapi uvicorn gunicorn pydantic asyncio sentencepiece spacy
 
 Start in local
 
@@ -41,6 +44,116 @@ Start in local
 deactivate your virtual environment if it's active:
 
     deactivate
+
+# Production Setup
+
+### Login VM
+
+    ssh azureuser@YOUR-VM-PUBLIC-IP
+
+### Install Git
+
+    sudo apt update
+    sudo apt install git -y
+    git clone https://github.com/Veer034/cn-lexi-mail-ai.git
+
+### Install Python
+
+    sudo add-apt-repository ppa:deadsnakes/ppa -y
+    sudo apt update
+    sudo apt install python3.10 python3.10-venv python3.10-distutils
+
+### Activiate Env
+
+    #can change the env names
+    python3.10 -m venv myvenv
+    source myvenv/bin/activate
+
+    #make sure version is 3.10.*
+    python --version
+
+### Install library in production VM
+
+    pip install "numpy<2.0.0"  sentence-transformers torch elasticsearch confluent-kafka httpx aiohttp python-json-logger transformers python-dotenv nltk langdetect fastapi uvicorn gunicorn pydantic asyncio sentencepiece spacy
+
+### Create Systemd file for as a service execution
+
+    sudo tee /etc/systemd/system/cn-lexi-mail-ai.service > /dev/null << EOF
+    [Unit]
+    Description=For data forging
+    After=network.target ollama.service
+    Requires=ollama.service
+
+    [Service]
+    Type=simple
+    User=azureuser
+    WorkingDirectory=/home/azureuser/cn-lexi-mail-ai
+    Environment=PATH=/home/azureuser/cn-lexi-mail-ai/myvenv/bin
+    ExecStart=/home/azureuser/cn-lexi-mail-ai/myvenv/bin/python master.py
+    Restart=always
+    RestartSec=10
+    StandardOutput=journal
+    StandardError=journal
+
+    [Install]
+    WantedBy=multi-user.target
+    EOF
+
+### HuggingFace model storage location
+
+    ~/.cache/huggingface/
+
+### Reload systemd
+
+    sudo systemctl daemon-reload
+
+### Enable all services to start on boot
+
+    sudo systemctl enable cn-lexi-mail-ai
+
+### Start Service
+
+    sudo systemctl start cn-lexi-mail-ai
+
+### Check Status
+
+    sudo systemctl status cn-lexi-mail-ai
+
+### Stop service
+
+    sudo systemctl stop cn-lexi-mail-ai
+
+### Restart service
+
+    sudo systemctl restart cn-lexi-mail-ai
+
+### Check logs for specific service
+
+    sudo journalctl -u cn-lexi-mail-ai -f
+
+### Check service generated logs
+
+    tail -n 50 ~/cn-lexi-mail-ai/logs/server.log
+
+### Ollama model list
+
+    ollama list
+
+### List all topics
+
+kafka-topics.sh --list --bootstrap-server 57.159.53.43:9092
+
+### Describe a specific topic
+
+kafka-topics.sh --describe --topic tenant.documents.vector.storage.request --bootstrap-server 57.159.53.43:9092
+
+### Describe all topics
+
+kafka-topics.sh --describe --bootstrap-server 57.159.53.43:9092
+
+### Describe multiple specific topics
+
+kafka-topics.sh --describe --topic tenant.documents.vector.storage.request,tenant.faq.vector.storage.request --bootstrap-server 57.159.53.43:9092
 
 Kafka email message for classification :
 

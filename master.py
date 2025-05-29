@@ -22,11 +22,8 @@ from response import EmailClassificationDto, Advice,Complaint
 
 
 # Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s"
-)
-logger = logging.getLogger(__name__)
+from logger_config import get_logger
+logger = get_logger(__name__)
 
 
 def detect_language(content):
@@ -430,7 +427,7 @@ class MultilingualMessageProcessor:
                 nlp = spacy.load(lang_models[language])
                 
                 # Process the text
-                doc = nlp(body_text)
+                doc = nlp(email_data)
                 
                 # Look for person names in the last few sentences (likely signature area)
                 sentences = list(doc.sents)

@@ -14,6 +14,11 @@ KAFKA_CONFIG = {
 
 ES_CONFIG = {
     'hosts': os.getenv('ES_HOSTS', 'http://localhost:9200'),
+    'username': os.getenv('ES_USERNAME',''),
+    'password': os.getenv('ES_PASSWORD',''),
+    'ca_certs': '/usr/local/share/ca-certificates/elasticsearch.crt',  # Point to certificate file
+    'verify_certs': True,
+    'ssl_show_warn': False,
     'index_name': os.getenv('ES_INDEX_NAME', 'tenant-documents-vector')
 }
 

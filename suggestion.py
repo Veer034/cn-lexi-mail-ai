@@ -5,11 +5,8 @@ from typing import List, Dict, Any, Optional
 from config import  MISTRAL_CONFIG
 
 # Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s"
-)
-logger = logging.getLogger(__name__)
+from logger_config import get_logger
+logger = get_logger(__name__)
 
 class SuggestionExtractor:
     def __init__(self, embedding_model=None):
