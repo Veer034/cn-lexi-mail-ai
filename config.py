@@ -13,18 +13,20 @@ KAFKA_CONFIG = {
 
 
 ES_CONFIG = {
-    'hosts': os.getenv('ES_HOSTS', 'http://localhost:9200'),
+    'hosts': [
+        f"https://{host.strip()}" for host in os.getenv('ES_HOSTS', 'localhost:9200').split(",")
+    ],
     'username': os.getenv('ES_USERNAME',''),
     'password': os.getenv('ES_PASSWORD',''),
     'ca_certs': '/usr/local/share/ca-certificates/elasticsearch.crt',  # Point to certificate file
     'verify_certs': True,
     'ssl_show_warn': False,
-    'index_name': os.getenv('ES_INDEX_NAME', 'tenant-documents-vector')
+    'tenant_document_index_name': os.getenv('ES_TENANT_DOCUMENTS_VECTOR_INDEX_NAME', 'tenant-documents-vector')
 }
 
 
 MISTRAL_CONFIG = {
     'service_url': os.getenv('MISTRAL_SERVICE_URL', 'http://localhost:11434/api/chat'),
-    'model': os.getenv('MISTRAL_MODEL', 'mistral'),
+    'model': os.getenv('MISTRAL_MODEL', 'mistral:7b-instruct-q4_0'),
     'timeout': 240,
 }

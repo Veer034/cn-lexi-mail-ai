@@ -32,9 +32,6 @@ Activiate Env
 
 Install library in local VM
 
-    #Required for kafka confluent
-    brew install librdkafka
-
     pip install "numpy<2.0.0"  sentence-transformers torch elasticsearch confluent-kafka httpx aiohttp python-json-logger transformers python-dotenv nltk langdetect fastapi uvicorn gunicorn pydantic asyncio sentencepiece spacy
 
 Start in local

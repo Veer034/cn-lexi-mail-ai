@@ -395,7 +395,7 @@ class QueryProcessor:
             
             # Execute search
             response = await self.es_client.search(
-                index=ES_CONFIG['index_name'],
+                index=ES_CONFIG['tenant_document_index_name'],
                 body=query,
                 size=top_k
             )
