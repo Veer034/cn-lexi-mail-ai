@@ -42,6 +42,8 @@ deactivate your virtual environment if it's active:
 
     deactivate
 
+---
+
 # Production Setup
 
 ### Login VM
@@ -96,6 +98,25 @@ deactivate your virtual environment if it's active:
     WantedBy=multi-user.target
     EOF
 
+### Copy trained model from GCP cloud storage
+
+    # Install Google Cloud SDK
+    curl https://sdk.cloud.google.com | bash
+    exec -l $SHELL
+
+    # Initialize and authenticate
+    gcloud init
+    gcloud auth login
+
+    # Download single file
+    gsutil cp gs://your-bucket-name/path/to/file.txt ./
+
+    # Download entire directory
+    gsutil -m cp -r gs://your-bucket-name/directory/ ./
+
+    # Download with progress and resume capability
+    gsutil -m cp -r -n gs://your-bucket-name/large-directory/ ./
+
 ### HuggingFace model storage location
 
     ~/.cache/huggingface/
@@ -132,11 +153,9 @@ deactivate your virtual environment if it's active:
 
     tail -n 50 ~/cn-lexi-mail-ai/logs/server.log
 
-### Ollama model list
+---
 
-    ollama list
-
-### List all topics
+### List kafka topics
 
 kafka-topics.sh --list --bootstrap-server 57.159.53.43:9092
 
