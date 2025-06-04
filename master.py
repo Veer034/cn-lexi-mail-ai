@@ -87,83 +87,121 @@ def detect_language(content):
 class MultilingualMessageProcessor:
     
     def __init__(self, model_path=None):
-        # Initialize SentenceTransformer with multilingual model
-        model_name = 'paraphrase-multilingual-mpnet-base-v2'
-        # model_path = models_path or os.path.join(os.getcwd(), 'models', 'sentence_transformer')
+        logger.info("=" * 60)
+        logger.info("INITIALIZING MULTILINGUAL MESSAGE PROCESSOR")
+        logger.info("=" * 60)
         
-        self.shutdown_requested = False
-        signal.signal(signal.SIGTERM, self._signal_handler)
-        signal.signal(signal.SIGINT, self._signal_handler)
+        # Log system information
+        logger.info(f"Server startup time: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        logger.info(f"Python version: {os.sys.version}")
+        logger.info(f"Process ID: {os.getpid()}")
        
+    
         try:
-            if model_path:
-                logger.info(f"Loading model from local path: {model_path}")
-                self.st_model = SentenceTransformer(model_path)
-            else:
-                logger.info(f"Loading model {model_name} from Hugging Face")
-                self.st_model = SentenceTransformer(model_name)
+            # Kafka configuration
+            logger.info("Loading Kafka configuration...")
+            self.consumer_config = {
+                'bootstrap.servers': KAFKA_CONFIG['bootstrap_servers'],
+                'group.id': KAFKA_CONFIG['group_id'],
+                'auto.offset.reset': KAFKA_CONFIG.get('auto_offset_reset', 'earliest'),
+                'enable.auto.commit': True,
+                'session.timeout.ms': 45000,
+                'heartbeat.interval.ms': 15000,
+                'request.timeout.ms': 65000
+            }
+            
+            self.producer_config = {
+                'bootstrap.servers': KAFKA_CONFIG['bootstrap_servers']
+            }
+            
+            # Kafka topic
+            self.topic = KAFKA_CONFIG['classification_request_topic']
+            logger.info("✓ Kafka configuration loaded successfully")
+
+            # Initialize HTTP client
+            logger.info("Initializing HTTP client...")
+            self.http_client = httpx.AsyncClient(timeout=30.0)
+            logger.info("✓ HTTP client initialized successfully")
+                
+
+        
+            # Initialize async Elasticsearch client
+            logger.info("Initializing Elasticsearch client...")
+            self.es_client = AsyncElasticsearch(
+                ES_CONFIG['hosts'],
+                basic_auth=(ES_CONFIG['username'], ES_CONFIG['password']),
+                verify_certs=ES_CONFIG.get('verify_certs', True),
+                ssl_show_warn=ES_CONFIG.get('ssl_show_warn', True),
+                ca_certs=ES_CONFIG.get('ca_certs'),  # Add this line
+                retry_on_timeout=True,
+                max_retries=3
+            )
+            logger.info("✓ Elasticsearch client initialized successfully")
+                
+            # Initialize SentenceTransformer with multilingual model
+            model_name = 'paraphrase-multilingual-mpnet-base-v2'
+            # model_path = models_path or os.path.join(os.getcwd(), 'models', 'sentence_transformer')
+        
+            try:
+                if model_path:
+                    logger.info(f"Loading model from local path: {model_path}")
+                    self.st_model = SentenceTransformer(model_path)
+                else:
+                    logger.info(f"Loading model {model_name} from Hugging Face")
+                    self.st_model = SentenceTransformer(model_name)
+            except Exception as e:
+                logger.error(f"Error loading sentence transformer model: {e}")
+                raise
+            
+
+            self.categories = self._load_categories()
+            
+
+            # Create EmailProcessor instance
+            self.query_processor = QueryProcessor(
+                es_client=self.es_client,
+                embedding_model=self.st_model
+            )
+
+            self.complaint_extractor = ComplaintExtractor(
+                es_client=self.es_client,
+                embedding_model=self.st_model
+            )
+
+            self.suggestion_extractor = SuggestionExtractor(
+                embedding_model=self.st_model
+            )
+
+            self.email_classifier = EmailClassifier()
+
+            
+            # Try to download nltk data for multiple languages
+            try:
+                nltk.download('punkt', quiet=True)
+            except Exception as e:
+                logger.warning(f"Failed to download NLTK punkt: {str(e)}")
+            
+            
+            # Initialize shutdown flag
+            self.shutdown_requested = False
+            
+            # Setup signal handlers for graceful shutdown
+            signal.signal(signal.SIGINT, self._signal_handler)
+            signal.signal(signal.SIGTERM, self._signal_handler)
+            logger.info("✓ Signal handlers configured for graceful shutdown")
+            
+            logger.info("=" * 60)
+            logger.info("✓ MULTILINGUAL MESSAGE PROCESSOR INITIALIZED SUCCESSFULLY")
+            logger.info("=" * 60)
+
         except Exception as e:
-            logger.error(f"Error loading sentence transformer model: {e}")
+            logger.error("=" * 60)
+            logger.error("✗ FAILED TO INITIALIZE MULTILINGUAL MESSAGE PROCESSOR")
+            logger.error(f"Error: {str(e)}")
+            logger.error("=" * 60)
             raise
-        
-        # Initialize async Elasticsearch client
-        self.es_client = AsyncElasticsearch(
-            ES_CONFIG['hosts'],
-            basic_auth=(ES_CONFIG.get('username', ''), ES_CONFIG.get('password', '')),
-            retry_on_timeout=True,
-            max_retries=3
-        )
-        
-        # Initialize httpx client
-        self.http_client = httpx.AsyncClient()
-        
-        # Kafka configuration
-        self.consumer_config = {
-            'bootstrap.servers': KAFKA_CONFIG['bootstrap_servers'],
-            'group.id': KAFKA_CONFIG['group_id'],
-            'auto.offset.reset': KAFKA_CONFIG.get('auto_offset_reset', 'earliest'),
-            'enable.auto.commit': True,
-            'session.timeout.ms': 45000,
-            'heartbeat.interval.ms': 15000,
-            'request.timeout.ms': 65000
-        }
-        
-        self.producer_config = {
-            'bootstrap.servers': KAFKA_CONFIG['bootstrap_servers']
-        }
-        
-        # Kafka topic
-        self.topic = KAFKA_CONFIG['classification_request_topic']
-
-        self.categories = self._load_categories()
-        
-
-        # Create EmailProcessor instance
-        self.query_processor = QueryProcessor(
-            es_client=self.es_client,
-            embedding_model=self.st_model
-        )
-
-        self.complaint_extractor = ComplaintExtractor(
-            es_client=self.es_client,
-            embedding_model=self.st_model
-        )
-
-        self.suggestion_extractor = SuggestionExtractor(
-            embedding_model=self.st_model
-        )
-
-        self.email_classifier = EmailClassifier()
-
-        
 
 
-        
-        # Try to download nltk data for multiple languages
-        try:
-            nltk.download('punkt', quiet=True)
-        except Exception as e:
-            logger.warning(f"Failed to download NLTK punkt: {str(e)}")
     
     def _signal_handler(self, sig, frame):
         """Handle shutdown signals gracefully"""
@@ -625,20 +663,29 @@ class MultilingualMessageProcessor:
         try:
             # Subscribe to topic
             consumer.subscribe([self.topic])
+            logger.info(f"✓ Successfully subscribed to Kafka topic: {self.topic}")
+            logger.info("🔄 Starting message consumption loop...")
+            
+            message_count = 0
+            last_heartbeat = datetime.datetime.now()
             
             while not self.shutdown_requested:
                 msg = consumer.poll(1.0)
+                
+                # Send periodic heartbeat logs
+                now = datetime.datetime.now()
+                if (now - last_heartbeat).seconds >= 30:  # Every 30 seconds
+                    logger.info(f"💓 Server heartbeat - Status: RUNNING | Messages processed: {message_count}")
+                    last_heartbeat = now
                 
                 if msg is None:
                     continue
                 
                 if msg.error():
                     if msg.error().code() == KafkaError._PARTITION_EOF:
-                        # End of partition event
-                        logger.info(f"Reached end of partition {msg.partition()}")
+                        logger.debug(f"Reached end of partition {msg.partition()}")
                     else:
-                        # Error
-                        logger.error(f"Error: {msg.error()}")
+                        logger.error(f"✗ Kafka consumer error: {msg.error()}")
                     continue
                 
                 # Process message
@@ -649,13 +696,20 @@ class MultilingualMessageProcessor:
                     elif isinstance(value, str):
                         value = json.loads(value)
                     
-                    logger.info(f"Received email message from partition {msg.partition()}, offset {msg.offset()}")
+                    message_count += 1
+                    tenant_id = value.get('tenantId', 'unknown')
+                    thread_id = value.get('threadId', 'unknown')
+                    
+                    logger.info(f"📨 Processing message #{message_count} | Tenant: {tenant_id} | Thread: {thread_id}")
+                    
                     await self.process_email_message(value)
-                    logger.info(f"Successfully processed email message for tenant {value.get('tenant_id')}")
+                    
+                    logger.info(f"✅ Successfully processed message #{message_count} for tenant: {tenant_id}")
+                    
                 except Exception as e:
                     request_id = str(uuid.uuid4())
-                    logger.error(f"Error requestId: {request_id} processing message: {str(e)}", exc_info=True)
-                    await self.send_to_dead_letter_queue(request_id,value, str(e))
+                    logger.error(f"✗ Error processing message #{message_count} | Request ID: {request_id} | Error: {str(e)}", exc_info=True)
+                    await self.send_to_dead_letter_queue(request_id, value, str(e))
                     
         except KeyboardInterrupt:
             pass
@@ -665,41 +719,114 @@ class MultilingualMessageProcessor:
 
     async def run(self):
         """Main processing loop"""
-        logger.info("Starting message processing...")
+        logger.info("=" * 60)
+        logger.info("STARTING MULTILINGUAL MESSAGE PROCESSOR SERVER")
+        logger.info("=" * 60)
         
-        # Initialize producer
-        self.producer = Producer(self.producer_config)
-        logger.info("Producer initialized successfully")
-        
- 
-        # Start consuming messages
         try:
+            # Perform health check
+            if not await self.health_check():
+                logger.error("✗ Health check failed. Cannot start server.")
+                return
+            
+            # Initialize producer
+            logger.info("Initializing Kafka producer...")
+            self.producer = Producer(self.producer_config)
+            logger.info("✓ Kafka producer initialized successfully")
+            
+            logger.info("=" * 60)
+            logger.info("🚀 SERVER STARTED SUCCESSFULLY!")
+            logger.info(f"📧 Listening for messages on topic: {self.topic}")
+            logger.info(f"👥 Consumer group: {self.consumer_config['group.id']}")
+            logger.info(f"🏥 Server status: HEALTHY")
+            logger.info(f"⏰ Server ready at: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            logger.info("=" * 60)
+            
+            # Start consuming messages
             await self.consume_messages()
+            
         except Exception as e:
-            logger.error(f"Fatal error in main loop: {str(e)}", exc_info=True)
+            logger.error("=" * 60)
+            logger.error("✗ FATAL ERROR IN MAIN LOOP")
+            logger.error(f"Error: {str(e)}")
+            logger.error("=" * 60)
+            raise
         finally:
             await self.shutdown()
 
+    async def health_check(self):
+        """Perform health check on all components"""
+        logger.info("Performing health check...")
+        
+        try:
+            # Check Elasticsearch connection
+            logger.info("Checking Elasticsearch connection...")
+            es_info = await self.es_client.info()
+            logger.info(f"✓ Elasticsearch connection healthy - Version: {es_info['version']['number']}")
+            
+            # Check Kafka connection by creating a test consumer
+            logger.info("Checking Kafka connection...")
+            test_consumer = Consumer(self.consumer_config)
+            topics = test_consumer.list_topics(timeout=5)
+            test_consumer.close()
+            logger.info(f"✓ Kafka connection healthy - Available topics: {len(topics.topics)}")
+            
+            logger.info("✓ All health checks passed successfully")
+            return True
+            
+        except Exception as e:
+            logger.error(f"✗ Health check failed: {str(e)}")
+            return False
+
+
     async def shutdown(self):
         """Graceful shutdown"""
-        logger.info("Shutting down...")
+        logger.info("=" * 60)
+        logger.info("🛑 INITIATING GRACEFUL SHUTDOWN")
+        logger.info("=" * 60)
         
-        # Close the HTTP client
-        await self.http_client.aclose()
-        
-        # Close the Elasticsearch client
-        await self.es_client.close()
-        
-        # Ensure all messages are delivered before shutting down producer
-        self.producer.flush()
-        
-        logger.info("Resources closed.")
+        try:
+            # Close the HTTP client
+            logger.info("Closing HTTP client...")
+            await self.http_client.aclose()
+            logger.info("✓ HTTP client closed successfully")
+            
+            # Close the Elasticsearch client
+            logger.info("Closing Elasticsearch client...")
+            await self.es_client.close()
+            logger.info("✓ Elasticsearch client closed successfully")
+            
+            # Ensure all messages are delivered before shutting down producer
+            logger.info("Flushing Kafka producer...")
+            if hasattr(self, 'producer'):
+                self.producer.flush()
+                logger.info("✓ Kafka producer flushed successfully")
+            
+            logger.info("=" * 60)
+            logger.info("✅ GRACEFUL SHUTDOWN COMPLETED")
+            logger.info(f"🕐 Shutdown completed at: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            logger.info("=" * 60)
+            
+        except Exception as e:
+            logger.error(f"✗ Error during shutdown: {str(e)}", exc_info=True)
 
-# Example usage
+
 if __name__ == "__main__":
-    # Initialize processor
-    processor = MultilingualMessageProcessor()
-    logger.info("Initializing multilingual message processor...")
+    logger.info("=" * 80)
+    logger.info("🌟 MULTILINGUAL MESSAGE PROCESSOR - STARTING UP")
+    logger.info("=" * 80)
     
-    # Run the processor in an asyncio event loop
-    asyncio.run(processor.run())
+    try:
+        # Initialize processor
+        processor = MultilingualMessageProcessor()
+        
+        # Run the processor in an asyncio event loop
+        asyncio.run(processor.run())
+        
+    except KeyboardInterrupt:
+        logger.info("👋 Application terminated by user")
+    except Exception as e:
+        logger.error(f"💥 Application crashed: {str(e)}", exc_info=True)
+    finally:
+        logger.info("🏁 Application shutdown complete")
+        logger.info("=" * 80)

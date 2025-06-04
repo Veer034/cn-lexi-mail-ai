@@ -62,15 +62,6 @@ deactivate your virtual environment if it's active:
     sudo apt update
     sudo apt install python3.10 python3.10-venv python3.10-distutils
 
-### Activiate Env
-
-    #can change the env names
-    python3.10 -m venv myvenv
-    source myvenv/bin/activate
-
-    #make sure version is 3.10.*
-    python --version
-
 ### Install library in production VM
 
     pip install "numpy<2.0.0"  sentence-transformers torch elasticsearch confluent-kafka httpx aiohttp python-json-logger transformers python-dotenv nltk langdetect fastapi uvicorn gunicorn pydantic asyncio sentencepiece spacy
