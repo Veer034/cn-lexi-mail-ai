@@ -159,9 +159,13 @@ deactivate your virtual environment if it's active:
 
 kafka-topics.sh --list --bootstrap-server 57.159.53.43:9092
 
+### Create a specific topic
+
+kafka-topics.sh --create --topic email.classification.ai.request --bootstrap-server 57.159.53.43:9092
+
 ### Describe a specific topic
 
-kafka-topics.sh --describe --topic tenant.documents.vector.storage.request --bootstrap-server 57.159.53.43:9092
+kafka-topics.sh --describe --topic email.classification.ai.request --bootstrap-server 57.159.53.43:9092
 
 ### Describe all topics
 
@@ -169,7 +173,7 @@ kafka-topics.sh --describe --bootstrap-server 57.159.53.43:9092
 
 ### Describe multiple specific topics
 
-kafka-topics.sh --describe --topic tenant.documents.vector.storage.request,tenant.faq.vector.storage.request --bootstrap-server 57.159.53.43:9092
+kafka-topics.sh --describe --topic email.classification.ai.request,email.classification.ai.response,email.classification.ai.request_DLQ --bootstrap-server 57.159.53.43:9092
 
 Kafka email message for classification :
 

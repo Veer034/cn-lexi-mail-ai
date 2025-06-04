@@ -7,6 +7,7 @@ import nltk
 import httpx
 import logging
 import asyncio
+import signal
 from sentence_transformers import SentenceTransformer
 from elasticsearch import AsyncElasticsearch
 from pydantic import BaseModel, Field
@@ -85,18 +86,25 @@ def detect_language(content):
 
 class MultilingualMessageProcessor:
     
-    def __init__(self, models_path=None):
+    def __init__(self, model_path=None):
         # Initialize SentenceTransformer with multilingual model
         model_name = 'paraphrase-multilingual-mpnet-base-v2'
-        model_path = models_path or os.path.join(os.getcwd(), 'models', 'sentence_transformer')
+        # model_path = models_path or os.path.join(os.getcwd(), 'models', 'sentence_transformer')
         
-        # Use downloaded model if available, otherwise use the model name directly
-        if os.path.exists(model_path):
-            logger.info(f"Loading model from local path: {model_path}")
-            self.st_model = SentenceTransformer(model_path)
-        else:
-            logger.info(f"Local model not found. Loading model {model_name} from Hugging Face")
-            self.st_model = SentenceTransformer(model_name)
+        self.shutdown_requested = False
+        signal.signal(signal.SIGTERM, self._signal_handler)
+        signal.signal(signal.SIGINT, self._signal_handler)
+       
+        try:
+            if model_path:
+                logger.info(f"Loading model from local path: {model_path}")
+                self.st_model = SentenceTransformer(model_path)
+            else:
+                logger.info(f"Loading model {model_name} from Hugging Face")
+                self.st_model = SentenceTransformer(model_name)
+        except Exception as e:
+            logger.error(f"Error loading sentence transformer model: {e}")
+            raise
         
         # Initialize async Elasticsearch client
         self.es_client = AsyncElasticsearch(
@@ -156,6 +164,12 @@ class MultilingualMessageProcessor:
             nltk.download('punkt', quiet=True)
         except Exception as e:
             logger.warning(f"Failed to download NLTK punkt: {str(e)}")
+    
+    def _signal_handler(self, sig, frame):
+        """Handle shutdown signals gracefully"""
+        logger.info(f"Received signal {sig}, initiating graceful shutdown...")
+        self.shutdown_requested = True
+
 
     def _load_categories(self):
         try:
@@ -612,7 +626,7 @@ class MultilingualMessageProcessor:
             # Subscribe to topic
             consumer.subscribe([self.topic])
             
-            while True:
+            while not self.shutdown_requested:
                 msg = consumer.poll(1.0)
                 
                 if msg is None:
