@@ -112,6 +112,11 @@ deactivate your virtual environment if it's active:
 
     ~/.cache/huggingface/
 
+### List all services
+
+    systemctl list-units --type=service
+    systemctl list-units --type=service | grep cn-
+
 ### Reload systemd
 
     sudo systemctl daemon-reload
