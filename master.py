@@ -139,7 +139,7 @@ class MultilingualMessageProcessor:
                 basic_auth=(ES_CONFIG['username'], ES_CONFIG['password']),
                 verify_certs=ES_CONFIG.get('verify_certs', True),
                 ssl_show_warn=ES_CONFIG.get('ssl_show_warn', True),
-                ca_certs=self.get_clean_cert_path(ES_CONFIG.get('ca_certs')),  # Add this line
+                ca_certs=ES_CONFIG.get('ca_certs'),  # Add this line
                 retry_on_timeout=True,
                 max_retries=3
             )
@@ -208,24 +208,6 @@ class MultilingualMessageProcessor:
             logger.error("=" * 60)
             raise
 
-
-    def get_clean_cert_path(self, cert_path: str) -> str:
-        pem_lines = []
-        inside_cert = False
-        with open(cert_path, "r") as f:
-            for line in f:
-                if "-----BEGIN CERTIFICATE-----" in line:
-                    inside_cert = True
-                if inside_cert:
-                    pem_lines.append(line)
-                if "-----END CERTIFICATE-----" in line:
-                    break
-
-        # Write to a temporary file automatically
-        tmp_file = tempfile.NamedTemporaryFile(delete=False, mode="w", suffix=".pem")
-        tmp_file.write("".join(pem_lines))
-        tmp_file.close()
-        return tmp_file.name
 
     def _signal_handler(self, sig, frame):
         """Handle shutdown signals gracefully"""
