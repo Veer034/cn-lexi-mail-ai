@@ -149,6 +149,22 @@ deactivate your virtual environment if it's active:
 
     tail -n 50 ~/cn-lexi-mail-ai/logs/server.log
 
+### Check logs for that service
+
+    journalctl -u cn-lexi-mail-ai.service
+
+### Rotate the journal for that service (so old logs can be vacuumed)
+
+    sudo journalctl --unit=cn-lexi-mail-ai.service --rotate
+
+### Delete old logs for that service
+
+    sudo journalctl --unit=cn-lexi-mail-ai.service --vacuum-time=1s
+
+
+    # Or to keep only the last 7 days:
+    sudo journalctl --unit=cn-lexi-mail-ai.service --vacuum-time=7d
+
 ---
 
 ### List kafka topics

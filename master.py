@@ -87,6 +87,8 @@ def detect_language(content):
 
 
 class MultilingualMessageProcessor:
+
+    
     
     def __init__(self, model_path=None):
         logger.info("=" * 60)
@@ -129,12 +131,14 @@ class MultilingualMessageProcessor:
         
             # Initialize async Elasticsearch client
             logger.info("Initializing Elasticsearch client...")
+
+            
             self.es_client = AsyncElasticsearch(
                 ES_CONFIG['hosts'],
                 basic_auth=(ES_CONFIG['username'], ES_CONFIG['password']),
                 verify_certs=ES_CONFIG.get('verify_certs', True),
                 ssl_show_warn=ES_CONFIG.get('ssl_show_warn', True),
-                ca_certs=ES_CONFIG.get('ca_certs'),  # Add this line
+                ca_certs=self.get_clean_cert_path(ES_CONFIG.get('ca_certs')),  # Add this line
                 retry_on_timeout=True,
                 max_retries=3
             )
@@ -204,6 +208,28 @@ class MultilingualMessageProcessor:
             raise
 
 
+    def get_clean_cert_path(cert_path: str) -> str:
+        """
+        Reads a certificate file and extracts only the PEM certificate block.
+        Returns a path to a temporary clean PEM file.
+        """
+        clean_cert_path = cert_path + ".clean.pem"
+        inside_cert = False
+        pem_lines = []
+
+        with open(cert_path, "r") as f:
+            for line in f:
+                if "-----BEGIN CERTIFICATE-----" in line:
+                    inside_cert = True
+                if inside_cert:
+                    pem_lines.append(line)
+                if "-----END CERTIFICATE-----" in line:
+                    break
+
+        with open(clean_cert_path, "w") as f:
+            f.write("".join(pem_lines))
+
+        return clean_cert_path
     
     def _signal_handler(self, sig, frame):
         """Handle shutdown signals gracefully"""
