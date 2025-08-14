@@ -18,9 +18,9 @@ ES_CONFIG = {
     ],
     'username': os.getenv('ES_USERNAME',''),
     'password': os.getenv('ES_PASSWORD',''),
-    'ca_certs': '/usr/local/share/ca-certificates/elasticsearch.pem',  # Point to certificate file
+    'ca_certs': '/usr/local/share/ca-certificates/elasticsearch.crt',  # Point to certificate file
     'verify_certs': True,
-    'ssl_show_warn': False,
+    'ssl_show_warn': True,
     'tenant_document_index_name': os.getenv('ES_TENANT_DOCUMENTS_VECTOR_INDEX_NAME', 'tenant-documents-vector')
 }
 

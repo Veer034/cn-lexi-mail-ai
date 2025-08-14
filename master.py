@@ -21,7 +21,6 @@ from complaint import ComplaintExtractor
 from suggestion import SuggestionExtractor
 from response import EmailClassificationDto, Advice,Complaint
 from contextvars import ContextVar
-import tempfile
 
 # Configure logging
 from logger_config import get_logger
