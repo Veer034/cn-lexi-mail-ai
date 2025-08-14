@@ -21,6 +21,7 @@ from complaint import ComplaintExtractor
 from suggestion import SuggestionExtractor
 from response import EmailClassificationDto, Advice,Complaint
 from contextvars import ContextVar
+import tempfile
 
 # Configure logging
 from logger_config import get_logger
@@ -208,15 +209,9 @@ class MultilingualMessageProcessor:
             raise
 
 
-    def get_clean_cert_path(cert_path: str) -> str:
-        """
-        Reads a certificate file and extracts only the PEM certificate block.
-        Returns a path to a temporary clean PEM file.
-        """
-        clean_cert_path = cert_path + ".clean.pem"
-        inside_cert = False
+    def get_clean_cert_path(self, cert_path: str) -> str:
         pem_lines = []
-
+        inside_cert = False
         with open(cert_path, "r") as f:
             for line in f:
                 if "-----BEGIN CERTIFICATE-----" in line:
@@ -226,11 +221,12 @@ class MultilingualMessageProcessor:
                 if "-----END CERTIFICATE-----" in line:
                     break
 
-        with open(clean_cert_path, "w") as f:
-            f.write("".join(pem_lines))
+        # Write to a temporary file automatically
+        tmp_file = tempfile.NamedTemporaryFile(delete=False, mode="w", suffix=".pem")
+        tmp_file.write("".join(pem_lines))
+        tmp_file.close()
+        return tmp_file.name
 
-        return clean_cert_path
-    
     def _signal_handler(self, sig, frame):
         """Handle shutdown signals gracefully"""
         logger.info(f"Received signal {sig}, initiating graceful shutdown...")
