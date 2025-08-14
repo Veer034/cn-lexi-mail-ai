@@ -82,6 +82,7 @@ deactivate your virtual environment if it's active:
     ExecStart=/home/azureuser/cn-lexi-mail-ai/myvenv/bin/python master.py
     Restart=always
     RestartSec=10
+    StartLimitIntervalSec=0
     StandardOutput=journal
     StandardError=journal
 

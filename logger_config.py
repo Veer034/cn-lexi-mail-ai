@@ -35,7 +35,7 @@ def setup_logging():
     console_handler = logging.StreamHandler(sys.stdout)
 
     formatter = SafeFormatter(
-        fmt="%(asctime)s [%(threadName)s] [%(tracking_id)s] %(levelname)s %(name)s - %(message)s",
+        fmt="%(asctime)s [%(threadName)s] [%(tracking_id)s] [%(levelname)s] %(name)s - %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S"
     )
 
