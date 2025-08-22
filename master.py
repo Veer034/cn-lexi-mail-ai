@@ -26,7 +26,7 @@ from contextvars import ContextVar
 from logger_config import get_logger
 logger = get_logger(__name__)
 
-tracking_id_var = ContextVar("tracking_id", default="NA")
+tracking_id_var = ContextVar("X-Tracking-ID", default="NA")
 
 
 def detect_language(content):
@@ -261,11 +261,14 @@ class MultilingualMessageProcessor:
             else:
                 future.set_result(msg)
         
-        # Get current trackingId
+        # Get current trackingId and ensure it's a string
         tracking_id = tracking_id_var.get() or "NA"
+        if isinstance(tracking_id, bytes):
+            tracking_id_str = tracking_id.decode("utf-8")
+        else:
+            tracking_id_str = str(tracking_id)
 
-
-        self.producer.produce(topic, key=serialized_key, value=serialized_classification, callback=delivery_callback,headers=[("trackingId", tracking_id.encode("utf-8"))])
+        self.producer.produce(topic, key=serialized_key, value=serialized_classification, callback=delivery_callback,headers=[("X-Tracking-ID", tracking_id_str)])
         self.producer.poll(1)  # Trigger delivery callbacks
         self.producer.flush()   # Ensure delivery
         
@@ -711,8 +714,8 @@ class MultilingualMessageProcessor:
                     
                     # --- Set the tracking ID from Kafka headers before logging ---
                     kafka_headers = dict(msg.headers() or [])
-                    tracking_id = kafka_headers.get('trackingId', 'NA')
-                    tracking_id_var.set(tracking_id)
+                    tracking_id = kafka_headers.get('X-Tracking-ID', b'NA')
+                    tracking_id_var.set(tracking_id.decode('utf-8') if isinstance(tracking_id, bytes) else str(tracking_id))
 
                     logger.info(f"📨 Processing message #{message_count} | Tenant: {tenant_id} | Thread: {thread_id}")
                     

@@ -6,7 +6,7 @@ from logging.handlers import RotatingFileHandler
 import contextvars
 
 # Context variable to hold tracking_id per request
-tracking_id_var = contextvars.ContextVar("tracking_id", default="NA")
+tracking_id_var = contextvars.ContextVar("X-Tracking-ID", default="NA")
 
 # Logging Filter to inject tracking_id and threadName
 class ContextFilter(logging.Filter):
