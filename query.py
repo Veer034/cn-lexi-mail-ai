@@ -1,4 +1,5 @@
 import json
+import re
 import httpx
 import logging
 import datetime
@@ -6,7 +7,6 @@ import asyncio
 from typing import List, Dict, Any, Optional, Set
 from config import  ES_CONFIG, MISTRAL_CONFIG
 from pydantic import BaseModel, Field
-
 
 # Configure logging
 from logger_config import get_logger
@@ -26,21 +26,68 @@ class QueryProcessor:
         self.embedding_model = embedding_model
         
 
-    async def generate_query_responses(self, tenant_id: str, thread_id:str, sender_name:str, email_content: str, language: str, type: str, subtype: Optional[str] = None) -> Dict[str,Any]:
+    async def extract_query_generate_responses(self, tenant_id: str, thread_id:str, sender_name:str, email_content: str, language: str, type: str, subtype: Optional[str] = None, query_ai_mode: str = None, template: str = None, query_regards: str= None) -> Dict[str,Any]:
         
          # Extract all questions from the email
         questions_batch = await self.extract_multiple_questions(email_content,language,type,subtype)
         
         if not questions_batch:
             logger.warning(f"No questions found in the email for tenantId: {tenant_id}, ThreadId: {thread_id}")
-            # Handle case with no questions detected
-            
-            return ""
+            # Generate professional response even without questions
+            return await self.generate_no_questions_response(sender_name, email_content, language, query_ai_mode, template)
         
 
-        query_response = await self.batch_generate_responses(sender_name,email_content,questions_batch,tenant_id,language)
-        query_response_dict = json.loads(query_response)  
-        return query_response_dict
+        query_response = await self.batch_generate_responses(sender_name,email_content,questions_batch,tenant_id,language,query_ai_mode,template,query_regards)
+        
+        # query_response is already a dictionary, no need to parse JSON
+        return query_response
+
+    async def generate_no_questions_response(self, sender_name: str, email_content: str, 
+                                           language: str, query_ai_mode: str = None, 
+                                           template: str = None) -> Dict[str, Any]:
+        """
+        Generate professional response when no questions are found
+        """
+        try:
+            system_prompt = f"""You are a professional customer service AI assistant responding in {language}.
+
+Generate a polite, professional email response that:
+1. Thanks the customer for their email
+2. Acknowledges receipt of their message
+3. Mentions that if they have specific questions, they're welcome to ask
+4. Maintains a helpful and courteous tone
+5. Ends with professional closing
+
+Respond directly in {language} language with a complete email response."""
+
+            user_prompt = f"""CUSTOMER EMAIL:
+From: {sender_name}
+Content: {email_content}
+
+Generate a professional acknowledgment response thanking {sender_name} for their email and letting them know we're here to help with any questions they may have."""
+
+            # Create API payload
+            data = self.create_mistral_payload(system_prompt, user_prompt, max_tokens=400)
+            data["model"] = MISTRAL_CONFIG['model']
+            
+            # Call API
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    MISTRAL_CONFIG['service_url'],
+                    headers={"Content-Type": "application/json"},
+                    json=data,
+                    timeout=MISTRAL_CONFIG['timeout']
+                )
+            
+            if response.status_code != 200:
+                logger.error(f"Mistral API error: {response.status_code}")
+                return {"message": {"content": f"Thank you for your email, {sender_name}. We appreciate you reaching out to us."}}
+            
+            return response.json()
+            
+        except Exception as e:
+            logger.error(f"Error generating no-questions response: {str(e)}")
+            return {"message": {"content": f"Thank you for your email, {sender_name}. We appreciate you reaching out to us."}}
 
 
     async def extract_multiple_questions(self, email_content: str, language: str, type: str, subtype: Optional[str] = None):
@@ -109,14 +156,61 @@ class QueryProcessor:
         
         try:
             content = response_data['message']['content']
-            questions = json.loads(content)
+            logger.info(f"Raw content: {content}")
+            
+            # Clean the content by removing markdown code blocks if present
+            cleaned_content = content.strip()
+            
+            # Remove ```json and ``` if present
+            if cleaned_content.startswith('```json'):
+                cleaned_content = cleaned_content[7:]  # Remove ```json
+            elif cleaned_content.startswith('```'):
+                cleaned_content = cleaned_content[3:]   # Remove ```
+                
+            if cleaned_content.endswith('```'):
+                cleaned_content = cleaned_content[:-3]  # Remove trailing ```
+                
+            # Remove any remaining whitespace/newlines
+            cleaned_content = cleaned_content.strip()
+            
+            logger.info(f"Cleaned content: {cleaned_content}")
+            
+            # Parse the JSON
+            questions = json.loads(cleaned_content)
+            
+            # Validate that questions is a list
+            if not isinstance(questions, list):
+                logger.error(f"Expected list but got {type(questions)}: {questions}")
+                return []
+                
+            logger.info(f"Extracted questions: {questions}")
             return questions
+            
+        except json.JSONDecodeError as e:
+            logger.error(f"JSON decode error: {e}")
+            logger.error(f"Content that failed to parse: {repr(content)}")
+            
+            # Fallback: Try to extract JSON using regex
+            try:
+                # Look for JSON array pattern in the content
+                json_match = re.search(r'\[.*?\]', content, re.DOTALL)
+                if json_match:
+                    json_str = json_match.group(0)
+                    questions = json.loads(json_str)
+                    if isinstance(questions, list):
+                        logger.info(f"Extracted questions via regex: {questions}")
+                        return questions
+            except Exception as fallback_error:
+                logger.error(f"Fallback regex extraction failed: {fallback_error}")
+            
+            return []
+            
         except Exception as e:
             logger.error(f"Error processing questions: {e}")
+            logger.error(f"Content: {repr(content)}")
             return []
-    
 
-    async def batch_generate_responses(self, sender_name: str, email_content:str, questions_batch: List[str], tenant_id: str, language: str) -> str:
+    async def batch_generate_responses(self, sender_name: str, email_content:str, questions_batch: List[str], tenant_id: str, language: str, query_ai_mode: str = None,template: str = None,query_regards: str= None) -> Dict[str, Any]:
         """
         Process multiple questions in batches to minimize API calls
         
@@ -127,7 +221,7 @@ class QueryProcessor:
             language: Language to generate responses in
             
         Returns:
-            List of dictionaries containing questions and responses
+            Dictionary containing the response data
         """
         
         # First, gather all documents for all non-API questions in the batch
@@ -142,12 +236,12 @@ class QueryProcessor:
             question_documents[question] = search_results
         
         # Process questions in smaller batches that fit within Mistral's context limits
-        return await self.process_questions(sender_name, email_content, question_documents, language)
+        return await self.process_questions(sender_name, email_content, question_documents, language,query_ai_mode,template,query_regards)
         
 
 
     async def process_questions(self, sender_name: str, email_content: str, question_documents: Dict[str, List[Dict]], 
-                            language: str) -> str:
+                            language: str, query_ai_mode: str = None,template: str = None,query_regards: str= None) -> Dict[str, Any]:
         """
         Process email using RAG approach - provide email body and relevant documents to Mistral.
         
@@ -159,7 +253,7 @@ class QueryProcessor:
             language: Language to generate responses in
             
         Returns:
-            Set of processed questions (for backward compatibility)
+            Dictionary containing the response data
         """
         # Token limit configuration
         MAX_TOKENS = 8192
@@ -208,80 +302,71 @@ class QueryProcessor:
 
         
         # Generate comprehensive response  and return
-        return  await self.generate_email_response(sender_name, email_content, documents_to_use, language)
+        return await self.generate_query_response(sender_name, email_content, question_documents, language,template,query_regards)
         
 
-    async def generate_email_response(self, sender_name: str, email_content: str, documents: List[Dict], language: str) -> str:
-        """
-        Generate a comprehensive response to the email with retrieved documents.
-        
-        Args:
-            sender_name: Name of the email sender
-            email_content: Original email content
-            documents: List of relevant documents to use for response generation
-            language: Language to generate responses in
-            
-        Returns:
-            Generated comprehensive response
-        """
+    async def generate_query_response(self, sender_name: str, email_content: str, 
+                            question_documents: Dict[str, List[Dict]], 
+                            language: str, template: str = None, query_regards: str = None) -> Dict[str, Any]:
+        """Generate structured query response with document-based answers"""
         try:
-            system_prompt = f"""You are a helpful email assistant that generates comprehensive responses based on retrieved information.
-            
-            IMPORTANT FORMATTING RULES:
-            1. Always respond in {language} language
-            2. DO NOT include a subject line
-            3. DO NOT add any information not explicitly stated in the provided documents
-            4. DO NOT mention timeframes unless they are explicitly mentioned in the documents
-            5. DO NOT add signature fields like [Your Name], [Your Position], etc.
-            6. End ALL emails with EXACTLY "[regardsSection]" - do not modify this placeholder
-            7. Always use "[supportEmailId]" for any email addresses
-            8. Always use "[supportContact]" for any contact information
-            
-            CONTENT RULES:
-            1. Use ONLY the information from the provided documents to formulate your response
-            2. If the documents don't contain information needed to answer a question, acknowledge this politely
-            3. Do not invent procedures, steps, or timeframes not mentioned in the documents
-            """
-            
-            # Prepare document context
-            document_context = ""
-            for doc in documents:
-                content = doc.get('content', '')
-                url = doc.get('url')
-                
-                document_context += f"{content}\n"
-                if url:  # Only add URL if it exists and is not None
-                    document_context += f"Source: {url}\n"
+            # Build system prompt based on template availability
+            if template:
+                system_prompt = f"""You are a professional customer service AI assistant responding in {language}.
 
-            
-            user_prompt = f"""ORIGINAL EMAIL:
-            {email_content}
-            
-            RELEVANT INFORMATION:
-            {document_context}
-            
-            Generate a response to this email that:
-            1. Starts with a greeting to {sender_name}
-            2. Addresses all questions using ONLY information from the documents
-            3. Uses "[supportEmailId]" for any email addresses
-            4. Uses "[supportContact]" for any contact information
-            5. Ends EXACTLY with "[regardsSection]" - do not add any other signature elements
-            
-            EXTREMELY IMPORTANT: Do not add ANY timeframes, processes, or steps that are not explicitly mentioned in the documents.
-            """
-            
-            # Call Mistral API
-            data = {
-                "model": MISTRAL_CONFIG['model'],
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
-                ],
-                "stream": False
-            }
-            
-            logger.info(f" data {data}")
+    Generate an email response following this template format:
+    {template}
 
+    Use ONLY information found in the provided documents. If information is not available in documents, clearly state "This information is not available in our current documentation."
+
+    Do not make promises or provide information not explicitly stated in the documents. Respond entirely in {language}."""
+            else:
+                if query_regards:
+                    system_prompt = f"""You are a professional customer service AI assistant responding in {language}.
+
+    Generate a professional email response with:
+    1. Professional greeting thanking {sender_name} for their email
+    2. Answer each question using ONLY information from provided documents
+    3. For questions without document support, state "This information is not available in our current documentation"
+    4. DO NOT add any closing, regards, or signature - stop immediately after the last answer
+
+    Use only facts from provided documents. Do not make promises not explicitly stated in documents. Respond entirely in {language}."""
+                else:
+                    system_prompt = f"""You are a professional customer service AI assistant responding in {language}.
+
+    Generate a professional email response with:
+    1. Professional greeting thanking {sender_name} for their email  
+    2. Answer each question using ONLY information from provided documents
+    3. For questions without document support, state "This information is not available in our current documentation"
+    4. Professional closing offering to help find additional information if needed
+
+    Use only facts from provided documents. Do not make promises not explicitly stated in documents. Respond entirely in {language}."""
+
+            # Build user prompt with document content
+            user_prompt = f"""CUSTOMER EMAIL:
+    From: {sender_name}
+    Content: {email_content}
+
+    QUESTIONS AND AVAILABLE DOCUMENTATION:
+    """
+            
+            for i, (question, docs) in enumerate(question_documents.items(), 1):
+                user_prompt += f"\nQuestion {i}: {question}\n"
+                if docs and docs[0].get('content'):
+                    user_prompt += f"Available information: {docs[0]['content'][:400]}\n"
+                    if docs[0].get('url'):
+                        user_prompt += f"Source: {docs[0]['url']}\n"
+                else:
+                    user_prompt += "No relevant documentation available for this question.\n"
+
+            user_prompt += f"\nGenerate professional email response in {language} using only the documentation provided above."
+
+            # Create API payload
+            data = self.create_mistral_payload(system_prompt, user_prompt, max_tokens=800)
+            data["model"] = MISTRAL_CONFIG['model']
+            data["temperature"] = 0.1
+            
+            # Call API
             async with httpx.AsyncClient() as client:
                 response = await client.post(
                     MISTRAL_CONFIG['service_url'],
@@ -291,16 +376,22 @@ class QueryProcessor:
                 )
             
             if response.status_code != 200:
-                logger.error(f"Mistral API error: {response.status_code} - {response.text}")
-                return f"Sorry, I couldn't generate a response at this time."
+                logger.error(f"Mistral API error: {response.status_code}")
+                return {"error": "Sorry, I couldn't generate a response at this time."}
             
-             
-            return response.json()
+            response_data = response.json()
+            
+            # Add query_regards if provided and no template
+            if not template and query_regards:
+                content = response_data['message']['content'].strip()
+                content = content + f"\n\n{query_regards}"
+                response_data['message']['content'] = content
+            
+            return response_data
             
         except Exception as e:
-            logger.error(f"Error generating email response: {str(e)}", exc_info=True)
-            return f"Sorry, I couldn't generate a response at this time."
-
+            logger.error(f"Error generating query response: {str(e)}")
+            return {"error": "Sorry, I couldn't generate a response at this time."}
 
     async def search_knowledge_base(self, question: str, tenant_id: str, language: str) -> List[Dict[str, Any]]:
         """
@@ -438,3 +529,27 @@ class QueryProcessor:
         """Synchronous method to generate embeddings (runs in a thread)"""
         embeddings = self.embedding_model.encode(query)
         return embeddings.tolist()
+    
+
+
+
+    def create_mistral_payload(self,system_prompt: str, user_prompt: str, max_tokens: int = 800) -> Dict[str, Any]:
+        """
+        Create Mistral API payload
+        
+        Args:
+            system_prompt: System prompt
+            user_prompt: User prompt
+            max_tokens: Maximum response tokens
+            
+        Returns:
+            API payload dictionary
+        """
+        return {
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            "stream": False,
+            "max_tokens": max_tokens
+        }

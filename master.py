@@ -17,9 +17,9 @@ from confluent_kafka.admin import AdminClient, NewTopic
 from config import KAFKA_CONFIG, ES_CONFIG, MISTRAL_CONFIG
 from deberta import EmailClassifier  # Import the function
 from query import QueryProcessor
-from complaint import ComplaintExtractor
-from suggestion import SuggestionExtractor
-from response import EmailClassificationDto, Advice,Complaint
+from complaint import ComplaintProcessor
+from suggestion import SuggestionProcessor
+from response import EmailClassificationDto, Advice,Complaint,TicketData
 from contextvars import ContextVar
 
 # Configure logging
@@ -138,7 +138,7 @@ class MultilingualMessageProcessor:
                 basic_auth=(ES_CONFIG['username'], ES_CONFIG['password']),
                 verify_certs=ES_CONFIG.get('verify_certs', True),
                 ssl_show_warn=ES_CONFIG.get('ssl_show_warn', True),
-                ca_certs=ES_CONFIG.get('ca_certs'),  # Add this line
+                # ca_certs=ES_CONFIG.get('ca_certs'),  # Add this line
                 retry_on_timeout=True,
                 max_retries=3
             )
@@ -169,13 +169,12 @@ class MultilingualMessageProcessor:
                 embedding_model=self.st_model
             )
 
-            self.complaint_extractor = ComplaintExtractor(
+            self.complaint_processor = ComplaintProcessor(
                 es_client=self.es_client,
                 embedding_model=self.st_model
             )
 
-            self.suggestion_extractor = SuggestionExtractor(
-                embedding_model=self.st_model
+            self.suggestion_processor = SuggestionProcessor(
             )
 
             self.email_classifier = EmailClassifier()
@@ -524,8 +523,20 @@ class MultilingualMessageProcessor:
         # Get content with fallback
         content = message.get('emailBody') or ""
         subject = message.get('subject') or ""
-        queryReplyGeneration = message.get('queryReplyGeneration') or False
-        autoComplaintTicketGeneration = message.get('autoComplaintTicketGeneration') or False
+        query_ai_mode = message.get('queryAIMode') or ""
+        query_reply_template = message.get('queryReplyTemplate') or ""
+        query_regards = message.get('queryRegards') or ""
+        
+
+        complaint_ai_mode = message.get('complaintAIMode') or ""
+        complaint_reply_template = message.get('complaintReplyTemplate') or ""
+        auto_complaint_ticket_generation = message.get('autoComplaintTicketGeneration') or False
+        complaint_regards = message.get('complaintRegards') or ""
+        
+        suggestion_ai_mode = message.get('suggestionAIMode') or ""
+        suggestion_reply_template = message.get('suggestionReplyTemplate') or ""
+        suggestion_regards = message.get('suggestionRegards') or ""
+        
 
 
 
@@ -564,71 +575,248 @@ class MultilingualMessageProcessor:
 
         logger.info(f"Email Type: {type} , SubType: {subtype}")
 
-  
         if type == "query":
-
-            # If query reply generation is not requed
-            if not queryReplyGeneration :
-                classification = EmailClassificationDto(tenantId=tenant_id, threadId=thread_id, messageId=message_id, type=type, subType=subtype)
- 
-            else :
-          
-                # Extract all questions from the email
-                query_response = await self.query_processor.generate_query_responses(tenant_id,thread_id,sender_name,complete_content, language,type,subtype)
+            # If query reply generation is not required
+            if query_ai_mode in ["no_reply", "template_only"]:
+                classification = EmailClassificationDto(
+                    tenantId=tenant_id, 
+                    threadId=thread_id, 
+                    messageId=message_id, 
+                    senderName=sender_name,
+                    type=type, 
+                    subType=subtype
+                )
+            else:
+                # Extract all questions from the email and generate responses
+                query_response = await self.query_processor.extract_query_generate_responses(
+                    tenant_id, 
+                    thread_id, 
+                    sender_name, 
+                    complete_content, 
+                    language, 
+                    type, 
+                    subtype, 
+                    query_ai_mode, 
+                    query_reply_template,
+                    query_regards
+                )
+                
+                # Determine response content
+                response_content = None
                 if query_response:
-                    response_content = query_response.get("message", {}).get("content", "No answer found")
-
-                    if content:
-                        classification = EmailClassificationDto(tenantId=tenant_id, threadId=thread_id, messageId=message_id, type=type, subType=subtype, queryResponse=response_content)
-
-                    else:
-                        classification = EmailClassificationDto(tenantId=tenant_id, threadId=thread_id, messageId=message_id, type=type, subType=subtype)
-
+                    response_content = query_response.get("message", {}).get("content")
+                    # Fallback if content is empty or None
+                    if not response_content:
+                        response_content = "No answer found"
+                
+                # Create classification with or without response content
+                if response_content and response_content != "No answer found":
+                    classification = EmailClassificationDto(
+                        tenantId=tenant_id, 
+                        threadId=thread_id, 
+                        messageId=message_id, 
+                        senderName=sender_name,
+                        type=type, 
+                        subType=subtype, 
+                        queryResponse=response_content
+                    )
                 else:
-                    classification = EmailClassificationDto(tenantId=tenant_id, threadId=thread_id, messageId=message_id, type=type, subType=subtype)       
-        
+                    classification = EmailClassificationDto(
+                        tenantId=tenant_id, 
+                        threadId=thread_id, 
+                        messageId=message_id, 
+                        senderName=sender_name,
+                        type=type, 
+                        subType=subtype
+                    )
+                    
         elif type == "complaint":
-            
-            if not autoComplaintTicketGeneration:
-                classification = EmailClassificationDto(tenantId=tenant_id, threadId=thread_id, messageId=message_id, type=type, subType=subtype)
- 
-            else :
-
-                complaint_list = await self.complaint_extractor.extract_complaints(tenant_id,complete_content, language)
-                logger.info(f" complaint_list {complaint_list}")
+            # If complaint reply generation is not required
+            if complaint_ai_mode in ["no_reply"] or complaint_ai_mode in ["template_only"] and not auto_complaint_ticket_generation:
+                classification = EmailClassificationDto(
+                    tenantId=tenant_id, 
+                    threadId=thread_id, 
+                    messageId=message_id, 
+                    senderName=sender_name,
+                    type=type, 
+                    subType=subtype
+                )
+            else:
+                # Step 1: Extract complaints and get relevant documents
+                complaint_list = await self.complaint_processor.extract_complaints(tenant_id, complete_content, language)
+                logger.info(f"complaint_list: {complaint_list}")
+                
+                complaint_response_content = None
                 
                 if complaint_list:
-                    complaints = complaint_list['complaints']  
+                    complaints = complaint_list.get('complaints', [])
+                    advices_data = complaint_list.get('advices', [])
 
                     # Create advice objects from the existing advices
                     advices_list = [
-                        Advice(query = advice["query"], advice=advice["advice"], url=advice["url"]) 
-                        for advice in complaint_list["advices"]
+                        Advice(
+                            query=advice.get("query", ""), 
+                            advice=advice.get("advice", ""), 
+                            url=advice.get("url", "#")
+                        ) 
+                        for advice in advices_data
                     ]
-                
                     
-                    # Create the complaint object directly using the question as is
+                    # Create the complaint object
                     complaint_object = Complaint(
                         complaints=complaints,  
                         advises=advices_list
                     )
                     
-                    # Use this in your EmailClassificationDto
+                    # Step 2: Generate complaint response if AI mode requires it
+                    if complaint_ai_mode not in ["no_reply", "template_only"]:
+                        # Convert advices_data to documents format for response generation
+                        documents_for_response = [
+                            {
+                                "content": advice.get("advice", ""),
+                                "url": advice.get("url", "#")
+                            }
+                            for advice in advices_data
+                        ]
+                        
+                        complaint_response = await self.complaint_processor.generate_complaint_response(
+                            sender_name=sender_name,
+                            email_content=complete_content,
+                            documents=documents_for_response,
+                            language=language,
+                            template=complaint_reply_template,
+                            complaint_regards=complaint_regards
+                        )
+
+                        if complaint_response:
+                            complaint_response_content = complaint_response  # It's already a string
+                            if not complaint_response_content or complaint_response_content.strip() == "":
+                                complaint_response_content = "No response generated"
+                    # Step 3: Generate ticket body if auto ticket generation is enabled
+                    ticket_data = None
+                    if auto_complaint_ticket_generation:
+                        try:
+                            ticket_data = await self.complaint_processor.generate_ticket_data(
+                                sender_name=sender_name,
+                                complaints=complaints,
+                                suggestions=advices_data,
+                                language=language
+                            )
+                            logger.info(f"Generated ticket data: {ticket_data}")
+                        except Exception as e:
+                            logger.error(f"Error generating ticket data: {e}")
+                            # Create fallback ticket
+                            ticket_data = TicketData(
+                                title=f"{subject}",
+                                description=f"{content}",
+                                priority="Medium"
+                            )
+                    
+                    # Step 4: Create classification with structured ticket data
+                    classification_data = {
+                        "tenantId": tenant_id,
+                        "threadId": thread_id,
+                        "messageId": message_id,
+                        "senderName": sender_name,
+                        "type": type,
+                        "subType": subtype,
+                        "complaint": complaint_object
+                    }
+                    
+                    # Add complaint response if generated
+                    if complaint_response_content and complaint_response_content != "No response generated":
+                        classification_data["complaintResponse"] = complaint_response_content
+                    
+                    # Add structured ticket data if generated
+                    if ticket_data:
+                        classification_data["ticketData"] = ticket_data
+
+                    classification = EmailClassificationDto(**classification_data)
+                    
+                else:
+                    # No complaints found
                     classification = EmailClassificationDto(
                         tenantId=tenant_id,
                         threadId=thread_id,
                         messageId=message_id,
+                        senderName=sender_name,
                         type=type,
-                        subType=subtype,
-                        complaint=complaint_object
+                        subType=subtype
                     )
 
-        elif type == "suggestion":
-            suggestion_list = await self.suggestion_extractor.extract_suggestions(complete_content, type, subtype,department, language )
-            classification = EmailClassificationDto(tenantId=tenant_id, threadId=thread_id, messageId=message_id, type=type,subType=subtype,suggestions=suggestion_list)
 
+        elif type == "suggestion":
+            # If suggestion reply generation is not required
+            if suggestion_ai_mode in ["no_reply", "template_only"]:
+                classification = EmailClassificationDto(
+                    tenantId=tenant_id, 
+                    threadId=thread_id, 
+                    messageId=message_id, 
+                    senderName=sender_name,
+                    type=type, 
+                    subType=subtype
+                )
+            else:
+                # Step 1: Extract suggestions (no document search needed)
+                suggestions_list = await self.suggestion_processor.extract_suggestions(
+                    email_content=complete_content,
+                    type=type,
+                    subType=subtype,
+                    language=language
+                )
+                logger.info(f"extracted suggestions: {suggestions_list}")
+                
+                suggestion_response_content = None
+                
+                if suggestions_list:
+                    # Step 2: Generate acknowledgment response if AI mode requires it
+                    if suggestion_ai_mode not in ["no_reply", "template_only"]:
+                        suggestion_response = await self.suggestion_processor.generate_suggestion_response(
+                            sender_name=sender_name,
+                            email_content=complete_content,
+                            suggestions=suggestions_list,  # Pass the suggestions directly
+                            language=language,
+                            template=suggestion_reply_template,
+                            suggestion_regards=suggestion_regards
+                        )
+                        
+                        if suggestion_response:
+                            # The method now returns a string directly
+                            suggestion_response_content = suggestion_response
+                            
+                            # Ensure we have valid content
+                            if not suggestion_response_content or suggestion_response_content.strip() == "None":
+                                suggestion_response_content = None
+                    
+                    # Step 3: Create classification with suggestions list and optional response
+                    classification_data = {
+                        "tenantId": tenant_id,
+                        "threadId": thread_id,
+                        "messageId": message_id,
+                        "senderName": sender_name,
+                        "type": type,
+                        "subType": subtype,
+                        "suggestions": suggestions_list  # Store as simple list
+                    }
+                    
+                    # Add suggestion response if generated and valid
+                    if suggestion_response_content and suggestion_response_content.strip():
+                        classification_data["suggestionResponse"] = suggestion_response_content
+                    
+                    classification = EmailClassificationDto(**classification_data)
+                    
+                else:
+                    # No suggestions found
+                    classification = EmailClassificationDto(
+                        tenantId=tenant_id,
+                        threadId=thread_id,
+                        messageId=message_id,
+                        senderName=sender_name,
+                        type=type,
+                        subType=subtype
+                    )
         else:
-            classification = EmailClassificationDto(tenantId=tenant_id, threadId=thread_id, messageId=message_id, type="spam",subType="")
+            classification = EmailClassificationDto(tenantId=tenant_id, threadId=thread_id, messageId=message_id, senderName=sender_name, type="spam",subType="")
 
 
       

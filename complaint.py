@@ -1,19 +1,23 @@
 import json
 import httpx
+import re
 import logging
 import datetime
 import asyncio
 from typing import List, Dict, Any, Optional
+from response import TicketData
 from config import  ES_CONFIG, MISTRAL_CONFIG
+
+
 
 # Configure logging
 from logger_config import get_logger
 logger = get_logger(__name__)
 
-class ComplaintExtractor:
+class ComplaintProcessor:
     def __init__(self, es_client=None, embedding_model=None):
         """
-        Initialize the ComplaintExtractor with required clients and models.
+        Initialize the ComplaintProcessor with required clients and models.
         
         Args:
             es_client: Elasticsearch client
@@ -23,7 +27,7 @@ class ComplaintExtractor:
         self.embedding_model = embedding_model
         
 
-    async def extract_complaints(self, tenant_id: str, email_content: str, language: str) -> List[Dict]:
+    async def extract_complaints(self, tenant_id: str, email_content: str, language: str) -> Dict:
         """
         Extract complaints and related information from an email
         
@@ -33,7 +37,7 @@ class ComplaintExtractor:
             language: Detected language of the email
             
         Returns:
-            List[Dict]: List of complaints with related advice
+            Dict: Dictionary with complaints and advices
         """
         try:
             # Extract complaints and related queries using Mistral
@@ -44,24 +48,20 @@ class ComplaintExtractor:
 
             if not complaints_list:
                 logger.info("No complaints found in the email")
-                return []
+                return {"complaints": [], "advices": []}
             
-            result = {}
-            
-
             # Perform vector search for each complaint
             advice_list = []
-            
             
             metadata_filters = {}
             if language and language != "unknown":
                 metadata_filters["language"] = language
             
-            # Then search using related queries for additional context
+            # Search using related queries for additional context
             for query in related_queries:
                 query_embedding = await self.generate_embeddings(query)
                 
-                # Use the vector_search method with the correct parameters
+                # Use the vector_search method
                 query_results = await self.vector_search(
                     embedding=query_embedding,
                     tenant_id=tenant_id,
@@ -70,15 +70,14 @@ class ComplaintExtractor:
                     metadata_filters=metadata_filters
                 )
                 
-                logger.info(f" query_results : {query_results}")
-
+                logger.info(f"Query results: {query_results}")
             
                 for item in query_results:
                     advice_content = item.get("content", "")
                     advice_url = item.get("url", "#") if item.get("url") is not None else "#"
-                    score = item.get("score", 0.5)  # Get the score from the vector search result
+                    score = item.get("score", 0.5)
                     
-                    # Check for duplicates based on content for the same query
+                    # Check for duplicates
                     is_duplicate = False
                     for existing in advice_list:
                         if existing["query"] == query and existing["advice"] == advice_content:
@@ -92,79 +91,66 @@ class ComplaintExtractor:
                             "query": query,
                             "advice": advice_content,
                             "url": advice_url,
-                            "score": score  # Use the actual score from vector search
+                            "score": score
                         })
 
-            # Sort by score (priority) and take top results
+            # Sort by score and take top results
             sorted_advice = sorted(advice_list, key=lambda x: x.get("score", 0), reverse=True)
-            top_advice = sorted_advice[:3]  # Limit to top 3 pieces of advice
+            top_advice = sorted_advice[:3]
             
-            # Format the final result
-            result = {
+            return {
                 "complaints": complaints_list,
                 "advices": top_advice
             }
-            
-            return result
         
         except Exception as e:
             logger.error(f"Error extracting complaints: {e}", exc_info=True)
-            return []
+            return {"complaints": [], "advices": []}
 
+    
     async def _extract_complaints_with_mistral(self, email_content: str, language: str) -> Dict:
         """
         Use Mistral AI to extract complaints and relevant information from email content.
-        
-        Args:
-            email_content: The content of the email to analyze
-            language: The language of the email content
-        
-        Returns:
-            Dict: Contains 'complaints' with extracted issues and 'related_queries' with common questions
         """
-        system_prompt = """You are a multilingual email analysis assistant specialized in identifying customer issues and relevant information.
-    Your task is to carefully analyze an email and extract two types of data:
-
-    1. COMPLAINTS: Actual expressions of dissatisfaction or problems reported by the customer. Extract the complaint in third-person format with relevant details (like order numbers, dates, product names).
-
-    2. RELATED QUERIES: Common questions or topics that this customer might need help with, based on their complaint. These should be worded as search queries that could be used to find relevant information in a knowledge base.
-
-    Be precise and focused on the actual content provided in the email."""
+        # Truncate email content if too long to avoid token issues
+        if len(email_content) > 1000:
+            email_content = email_content[:1000] + "..."
         
-        user_prompt = f"""
-    ORIGINAL EMAIL:
+        system_prompt = f"""Extract customer complaints and related queries from email in {language}.
+
+    RULES:
+    1. Extract complaints in third-person format using ACTUAL information from the email
+    2. Include any real order numbers, subscription IDs, transaction IDs, account numbers, or reference codes mentioned in the email
+    3. Generate 3-5 related search queries for knowledge base lookup
+    4. Return VALID JSON only: {{"complaints": [...], "related_queries": [...]}}
+    5. If no complaints, return empty arrays
+    6. Do NOT use backslashes or escape characters in JSON keys
+    7. Ensure JSON is properly formatted
+
+    IMPORTANT: Extract ACTUAL identifiers from the email content, not placeholder examples."""
+        
+        user_prompt = f"""EMAIL CONTENT TO ANALYZE:
     {email_content}
 
-    TASK:
-    Analyze the above email in {language} language. 
+    EXTRACTION INSTRUCTIONS:
+    1. Look for and include any actual order numbers, subscription IDs, transaction codes, account numbers, or reference IDs mentioned in the email
+    2. Extract complaints in third-person format using the real information from this email
+    3. Generate related search queries that would help find solutions to these specific complaints
 
-    STEP 1: Extract ALL specific complaints being expressed by the customer, rewritten in third-person format, including any relevant identifiers like order numbers or dates. For example, if the email says "I received damaged items from order #12345", extract "Customer received damaged items from order #12345".
+    CRITICAL: Use only the ACTUAL numbers, IDs, and information from the email content above. Do not use example placeholders like "#123".
 
-    STEP 2: Based on the complaints, generate 3-5 related search queries that would be useful to resolve the customer's issue. These should be short phrases someone might search for in a knowledge base.
-
-    Return your response as a JSON object with two arrays:
-    {{
-    "complaints": ["complaint1", "complaint2", ...],
-    "related_queries": ["how to resolve issue ", "steps to fix issue","damaged product policy", ...]
-    }}
-
-    If no complaints are found, return empty arrays for both fields.
-    """
+    Return only valid JSON in this format:
+    {{"complaints": ["Customer complaint with actual ID/number if present"], "related_queries": ["search term 1", "search term 2"]}}"""
         
-        # Call Mistral API
-        data = {
-            "model": MISTRAL_CONFIG['model'],
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
-            ],
-            "stream": False,
-            "max_tokens": 200,
-            "temperature": 0.1  # Lower temperature for more deterministic output
-        }
+        # Check token usage
+        estimated_tokens = self.estimate_tokens(system_prompt + user_prompt)
+        logger.info(f"Complaint extraction tokens: {estimated_tokens}")
         
+        # Create API payload
+        data = self.create_mistral_payload(system_prompt, user_prompt, max_tokens=250)
+        data["model"] = MISTRAL_CONFIG['model']
+        data["temperature"] = 0.1
         
-
         async with httpx.AsyncClient() as client:
             response = await client.post(
                 MISTRAL_CONFIG['service_url'],
@@ -178,63 +164,94 @@ class ComplaintExtractor:
             return {"complaints": [], "related_queries": []}
         
         response_data = response.json()
-        logger.info(f"response_data {response_data}")
+        logger.info(f"Extraction response: {response_data}")
         
         try:
             content = response_data['message']['content']
-            complaints = json.loads(content)
+            logger.info(f"Raw content: {content}")
+            
+            # Clean up the content to fix common JSON issues
+            cleaned_content = self._clean_json_content(content)
+            logger.info(f"Cleaned content: {cleaned_content}")
+            
+            complaints = json.loads(cleaned_content)
+            
+            # Validate the structure
+            if not isinstance(complaints, dict):
+                logger.warning("Response is not a dictionary, returning empty result")
+                return {"complaints": [], "related_queries": []}
+            
+            # Ensure required keys exist
+            if "complaints" not in complaints:
+                complaints["complaints"] = []
+            if "related_queries" not in complaints:
+                complaints["related_queries"] = []
+                
             return complaints
-        except Exception as e:
-            logger.error(f"Error processing response: {e}")
+            
+        except json.JSONDecodeError as e:
+            logger.error(f"JSON decode error: {e}")
+            logger.error(f"Failed content: {content}")
             return {"complaints": [], "related_queries": []}
-
+        except Exception as e:
+            logger.error(f"Error processing extraction response: {e}")
+            return {"complaints": [], "related_queries": []}
+    
+    def _clean_json_content(self, content: str) -> str:
+        """
+        Clean up common JSON formatting issues from AI responses.
+        """
+        # Remove any markdown formatting
+        content = re.sub(r'```json\s*', '', content)
+        content = re.sub(r'```\s*$', '', content)
+        
+        # Fix escaped underscores in JSON keys (common AI mistake)
+        content = re.sub(r'\\_', '_', content)
+        
+        # Remove extra whitespace
+        content = content.strip()
+        
+        # Extract JSON object if there's extra text
+        json_match = re.search(r'\{.*\}', content, re.DOTALL)
+        if json_match:
+            content = json_match.group()
+        
+        return content
 
     async def _generate_advice_with_mistral(self, query: str, document_content: str, language: str) -> str:
         """
-        Use Mistral AI to generate an answer for the query using only information present in the document content.
-        
-        Args:
-            query: The user's question
-            document_content: The content of the document to use as context
-            language: The language to generate the answer in
-        
-        Returns:
-            str: The answer generated from document content or the original document content if no answer could be found
+        Generate advice using document content with token optimization
         """
-        system_prompt = """You are a helpful assistant that answers questions based ONLY on the provided document content.
-    Your task is to:
-    1. Read the document content carefully
-    2. Look for information relevant to the query
-    3. If relevant information exists, provide a clear answer using ONLY facts from the document
-    4. Do NOT add any information not present in the document
-    5. If you cannot find relevant information to answer the query, return an empty string
-    """
+        # Optimize document content for token limits
+        if len(document_content) > 800:
+            document_content = document_content[:800] + "..."
         
-        user_prompt = f"""
-    DOCUMENT CONTENT:
-    {document_content}
+        system_prompt = f"""Answer query using ONLY document content in {language}.
 
-    QUERY:
-    {query}
-
-    TASK:
-    Answer the above query based ONLY on information present in the document content.
-    Generate your answer in {language} language.
-    Do not add any information that is not explicitly stated in the document.
-    If you cannot find enough information to answer the query, return an empty string.
-    """
+RULES:
+1. Use only facts from document
+2. If no relevant info, return empty string
+3. Be concise and accurate"""
         
-        # Call Mistral API
-        data = {
-            "model": MISTRAL_CONFIG['model'],
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
-            ],
-            "stream": False,
-            "max_tokens": 300,
-            "temperature": 0.1  # Lower temperature for more focused output
-        }
+        user_prompt = f"""DOCUMENT: {document_content}
+
+QUERY: {query}
+
+Answer using document info only."""
+        
+        # Check token usage
+        estimated_tokens = self.estimate_tokens(system_prompt + user_prompt)
+        if estimated_tokens > 1500:
+            # Further reduce document content
+            document_content = document_content[:400] + "..."
+            user_prompt = f"""DOCUMENT: {document_content}
+QUERY: {query}
+Answer using document info only."""
+        
+        # Create API payload
+        data = self.create_mistral_payload(system_prompt, user_prompt, max_tokens=300)
+        data["model"] = MISTRAL_CONFIG['model']
+        data["temperature"] = 0.1
         
         async with httpx.AsyncClient() as client:
             response = await client.post(
@@ -245,21 +262,262 @@ class ComplaintExtractor:
             )
         
         if response.status_code != 200:
-            logger.error(f"Mistral API error: {response.status_code} - {response.text}")
+            logger.error(f"Mistral API error for advice generation: {response.status_code}")
             return document_content
         
         response_data = response.json()
-        logger.info(f"response_data {response_data}")
         
         try:
             answer = response_data['message']['content']
-            # If answer is empty, return original document
             if not answer or answer.strip() == "":
                 return document_content
             return answer
         except Exception as e:
-            logger.error(f"Error processing response: {e}")
+            logger.error(f"Error processing advice response: {e}")
             return document_content
+
+    async def generate_complaint_response(self, sender_name: str, email_content: str, 
+                                        documents: List[Dict], language: str, 
+                                         template: str = None, 
+                                        complaint_regards: str = None) -> str:
+        """Generate complaint response with template and custom regards support"""
+        try:
+            # Build system prompt based on template availability
+            if template:
+                system_prompt = f"""You are a professional customer service AI assistant responding to complaints in {language}.
+
+    Generate an empathetic complaint response following this template format:
+    {template}
+
+    Use the provided document information to address the complaint appropriately.
+    Maintain the template structure while incorporating relevant solutions.
+    Show empathy and understanding for the customer's concerns.
+    Respond entirely in {language}."""
+            else:
+                if complaint_regards:
+                    system_prompt = f"""You are a professional customer service AI assistant responding to complaints in {language}.
+
+    Generate an empathetic complaint response with:
+    1. Sincere apology and acknowledgment of {sender_name}'s concerns
+    2. Address the complaint using provided document information
+    3. Offer solutions or next steps based on available information
+    4. DO NOT add any closing or regards section - stop after providing solutions
+
+    Show genuine empathy and take responsibility where appropriate.
+    Respond entirely in {language}."""
+                else:
+                    system_prompt = f"""You are a professional customer service AI assistant responding to complaints in {language}.
+
+    Generate an empathetic complaint response with:
+    1. Sincere apology and acknowledgment of {sender_name}'s concerns
+    2. Address the complaint using provided document information  
+    3. Offer solutions or next steps based on available information
+    4. Professional closing with commitment to resolve the issue
+
+    Show genuine empathy and take responsibility where appropriate.
+    Respond entirely in {language}."""
+
+            # Build user prompt with document content
+            user_prompt = f"""CUSTOMER COMPLAINT:
+    From: {sender_name}
+    Content: {email_content}
+
+    AVAILABLE INFORMATION FOR RESOLUTION:
+    """
+            
+            if documents:
+                for i, doc in enumerate(documents[:3], 1):  # Limit to top 3 documents
+                    user_prompt += f"\nDocument {i}: {doc['content'][:500]}\n"
+                    if doc.get('url'):
+                        user_prompt += f"Source: {doc['url']}\n"
+            else:
+                user_prompt += "No specific resolution information available in knowledge base.\n"
+
+            user_prompt += f"\nGenerate empathetic complaint response in {language} addressing {sender_name}'s concerns."
+
+            # Check token usage
+            estimated_tokens = self.estimate_tokens(system_prompt + user_prompt)
+            if estimated_tokens > 7000:
+                user_prompt = user_prompt[:4000] + "..."
+            
+            # Create API payload
+            data = self.create_mistral_payload(system_prompt, user_prompt, max_tokens=800)
+            data["model"] = MISTRAL_CONFIG['model']
+            
+            # Call API
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    MISTRAL_CONFIG['service_url'],
+                    headers={"Content-Type": "application/json"},
+                    json=data,
+                    timeout=MISTRAL_CONFIG['timeout']
+                )
+            
+            if response.status_code != 200:
+                logger.error(f"Mistral API error: {response.status_code} - {response.text}")
+                return "We sincerely apologize for the inconvenience. We are looking into your concerns and will respond promptly."
+            
+            response_data = response.json()
+            content = response_data['message']['content']
+            
+            # Add complaint_regards if provided and no template
+            if not template and complaint_regards:
+                content = content.strip() + f"\n\n{complaint_regards}"
+            
+            return content
+            
+        except Exception as e:
+            logger.error(f"Error generating complaint response: {str(e)}", exc_info=True)
+            return "We sincerely apologize for the inconvenience. We are looking into your concerns and will respond promptly."
+
+    async def generate_ticket_data(self, sender_name: str, complaints: List[str], 
+                             suggestions: List[Dict], language: str) -> Optional[TicketData]:
+        """Generate structured ticket data using AI for title, description, and priority"""
+        try:
+            # Limit and truncate data for token efficiency
+            limited_complaints = complaints[:5]  # Max 5 complaints
+            limited_suggestions = suggestions[:3]  # Max 3 suggestions
+            
+            # Truncate long items
+            short_complaints = [
+                c[:150] + "..." if len(c) > 150 else c 
+                for c in limited_complaints
+            ]
+            
+            # Create structured prompt for JSON response
+            system_prompt = f"""Generate structured ticket data in {language}. 
+
+    PRIORITY LEVELS: Low, Medium, High, Urgent
+
+    Return ONLY valid JSON with this exact structure:
+    {{
+    "title": "Brief ticket title (max 100 chars)",
+    "description": "Detailed description of issues and context",
+    "priority": "One of: Low, Medium, High, Urgent"
+    }}
+
+    PRIORITY GUIDELINES:
+    - Low: Minor issues, cosmetic problems
+    - Medium: Functional issues that don't block core features
+    - High: Core functionality affected, business impact
+    - Urgent: Critical system failures, data loss, security issues"""
+            
+            complaints_text = "\n".join([f"- {c}" for c in short_complaints])
+            suggestions_text = "\n".join([
+                f"- {s.get('suggestion', s.get('advice', ''))[:100]}" 
+                for s in limited_suggestions
+            ])
+            
+            user_prompt = f"""COMPLAINANT: {sender_name}
+
+    ISSUES REPORTED:
+    {complaints_text}
+
+    SUGGESTED SOLUTIONS:
+    {suggestions_text}
+
+    Generate structured ticket data as JSON only. No extra text."""
+            
+            # Check tokens and create payload using utils
+            estimated_tokens = self.estimate_tokens(system_prompt + user_prompt)
+            logger.info(f"Ticket generation tokens: {estimated_tokens}")
+            
+            data = self.create_mistral_payload(system_prompt, user_prompt, max_tokens=300)
+            data["model"] = MISTRAL_CONFIG['model']
+            data["temperature"] = 0.2
+            
+            # Call API
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    MISTRAL_CONFIG['service_url'],
+                    headers={"Content-Type": "application/json"},
+                    json=data,
+                    timeout=MISTRAL_CONFIG['timeout']
+                )
+            
+            if response.status_code != 200:
+                logger.error(f"Ticket generation API error: {response.status_code}")
+                return self._create_fallback_ticket(sender_name, short_complaints)
+            
+            response_data = response.json()
+            content = response_data.get("message", {}).get("content", "")
+            
+            if not content:
+                return self._create_fallback_ticket(sender_name, short_complaints)
+            
+            # Parse and validate the AI response
+            ticket_data = self._parse_ticket_response(content, sender_name, short_complaints)
+            return ticket_data
+            
+        except Exception as e:
+            logger.error(f"Error generating ticket: {e}", exc_info=True)
+            return self._create_fallback_ticket(sender_name, short_complaints or complaints)
+
+    def _parse_ticket_response(self, content: str, sender_name: str, complaints: List[str]) -> Optional[TicketData]:
+        """Parse AI response and create TicketData object"""
+        try:
+            # Clean content similar to complaint extraction
+            cleaned_content = self._clean_json_content(content)
+            logger.info(f"Cleaned ticket content: {cleaned_content}")
+            
+            ticket_json = json.loads(cleaned_content)
+            
+            # Validate required fields
+            if not all(key in ticket_json for key in ["title", "description", "priority"]):
+                logger.warning("Missing required fields in AI response")
+                return self._create_fallback_ticket(sender_name, complaints)
+            
+            # Validate priority level
+            priority = ticket_json["priority"]
+            if priority not in ["Low", "Medium", "High", "Urgent"]:
+                logger.warning(f"Invalid priority: {priority}, defaulting to Medium")
+                priority = "Medium"
+            
+            # Create TicketData object
+            ticket_data = TicketData(
+                title=ticket_json["title"][:100],  # Ensure max length
+                description=ticket_json["description"],
+                priority=priority
+            )
+            
+            return ticket_data
+            
+        except json.JSONDecodeError as e:
+            logger.error(f"JSON decode error in ticket parsing: {e}")
+            return self._create_fallback_ticket(sender_name, complaints)
+        except Exception as e:
+            logger.error(f"Error parsing ticket response: {e}")
+            return self._create_fallback_ticket(sender_name, complaints)
+
+    def _create_fallback_ticket(self, sender_name: str, complaints: List[str]) -> TicketData:
+        """Create fallback ticket when AI generation fails"""
+        issues_count = len(complaints) if complaints else 0
+        
+        return TicketData(
+            title=f"Customer Issue Report - {sender_name}",
+            description=f"Customer {sender_name} reported {issues_count} issue(s). Manual review required.\n\nIssues:\n" + 
+                    "\n".join([f"- {c}" for c in complaints[:3]]) if complaints else "No specific details available.",
+            priority= "Medium"
+        )
+
+    def _clean_json_content(self, content: str) -> str:
+        """Clean up common JSON formatting issues from AI responses"""
+        # Remove any markdown formatting
+        content = re.sub(r'```json\s*', '', content)
+        content = re.sub(r'```\s*$', '', content)
+        
+        # Fix escaped underscores in JSON keys
+        content = re.sub(r'\\_', '_', content)
+        
+        # Remove extra whitespace
+        content = content.strip()
+        
+        # Extract JSON object if there's extra text
+        json_match = re.search(r'\{.*\}', content, re.DOTALL)
+        if json_match:
+            content = json_match.group()
+        
+        return content
 
 
     async def vector_search(
@@ -363,26 +621,28 @@ class ComplaintExtractor:
         return embeddings.tolist()
 
 
+    def estimate_tokens(self,text: str) -> int:
+        """Estimate token count for text (1 token ≈ 4 characters + 20% buffer)"""
+        return int((len(text) / 4) * 1.2)
+
+    def create_mistral_payload(self,system_prompt: str, user_prompt: str, max_tokens: int = 800) -> Dict[str, Any]:
         """
-        Format the Elasticsearch matches into a clean structure.
+        Create Mistral API payload
         
         Args:
-            matches: List of Elasticsearch hit documents
+            system_prompt: System prompt
+            user_prompt: User prompt
+            max_tokens: Maximum response tokens
             
         Returns:
-            List of formatted Q&A pairs with metadata
+            API payload dictionary
         """
-        formatted_results = []
-        
-        for match in matches:
-            formatted_result = {
-                "content": match.get("content", ""),
-                "title": match.get("title", ""),
-                "score": match.get("score", 0),
-                "url": match.get("url", ""),
-                "metadata": match.get("metadata", {})
-            }
-            
-            formatted_results.append(formatted_result)
-            
-        return formatted_results
+        return {
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            "stream": False,
+            "max_tokens": max_tokens
+        }
+
