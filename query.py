@@ -303,63 +303,84 @@ Generate a professional acknowledgment response thanking {sender_name} for their
         
         # Generate comprehensive response  and return
         return await self.generate_query_response(sender_name, email_content, question_documents, language,template,query_regards)
-        
 
     async def generate_query_response(self, sender_name: str, email_content: str, 
                             question_documents: Dict[str, List[Dict]], 
                             language: str, template: str = None, query_regards: str = None) -> Dict[str, Any]:
         """Generate structured query response with document-based answers"""
         try:
-            # Build system prompt based on template availability
+            # Build system prompt based on template and regards availability
             if template:
-                system_prompt = f"""You are a professional customer service AI assistant responding in {language}.
+                if query_regards:
+                    system_prompt = f"""You are a customer service assistant responding in {language}.
 
-    Generate an email response following this template format:
+    Follow this template:
     {template}
 
-    Use ONLY information found in the provided documents. If information is not available in documents, clearly state "This information is not available in our current documentation."
+    Rules:
+    - Use only information from provided documents
+    - If no information available, state that information is not available in documentation
+    - Do not add any closing text or signatures
+    - Stop immediately after answering
 
-    Do not make promises or provide information not explicitly stated in the documents. Respond entirely in {language}."""
+    Respond in {language}."""
+                else:
+                    system_prompt = f"""You are a customer service assistant responding in {language}.
+
+    Follow this template:
+    {template}
+
+    Rules:
+    - Use only information from provided documents
+    - If no information available, state that information is not available in documentation
+
+    Respond in {language}."""
             else:
                 if query_regards:
-                    system_prompt = f"""You are a professional customer service AI assistant responding in {language}.
+                    system_prompt = f"""You are a customer service assistant responding in {language}.
 
-    Generate a professional email response with:
-    1. Professional greeting thanking {sender_name} for their email
-    2. Answer each question using ONLY information from provided documents
-    3. For questions without document support, state "This information is not available in our current documentation"
-    4. DO NOT add any closing, regards, or signature - stop immediately after the last answer
+    Write a response:
+    1. Thank {sender_name} for their message
+    2. Answer questions using only provided documents
+    3. If no information available, state that information is not available in documentation
 
-    Use only facts from provided documents. Do not make promises not explicitly stated in documents. Respond entirely in {language}."""
+    Rules:
+    - Do not add any closing text or signatures
+    - Stop immediately after the last answer
+
+    Respond in {language}."""
                 else:
-                    system_prompt = f"""You are a professional customer service AI assistant responding in {language}.
+                    system_prompt = f"""You are a customer service assistant responding in {language}.
 
-    Generate a professional email response with:
-    1. Professional greeting thanking {sender_name} for their email  
-    2. Answer each question using ONLY information from provided documents
-    3. For questions without document support, state "This information is not available in our current documentation"
-    4. Professional closing offering to help find additional information if needed
+    Write a response:
+    1. Thank {sender_name} for their message
+    2. Answer questions using only provided documents  
+    3. If no information available, state that information is not available in documentation
+    4. End with offer to help further
 
-    Use only facts from provided documents. Do not make promises not explicitly stated in documents. Respond entirely in {language}."""
+    Respond in {language}."""
 
-            # Build user prompt with document content
-            user_prompt = f"""CUSTOMER EMAIL:
-    From: {sender_name}
-    Content: {email_content}
+            # Build user prompt
+            user_prompt = f"""Customer: {sender_name}
+    Message: {email_content}
 
-    QUESTIONS AND AVAILABLE DOCUMENTATION:
+    Questions and documentation:
     """
             
             for i, (question, docs) in enumerate(question_documents.items(), 1):
                 user_prompt += f"\nQuestion {i}: {question}\n"
                 if docs and docs[0].get('content'):
-                    user_prompt += f"Available information: {docs[0]['content'][:400]}\n"
+                    user_prompt += f"Information: {docs[0]['content'][:400]}\n"
                     if docs[0].get('url'):
                         user_prompt += f"Source: {docs[0]['url']}\n"
                 else:
-                    user_prompt += "No relevant documentation available for this question.\n"
+                    user_prompt += "No documentation available.\n"
 
-            user_prompt += f"\nGenerate professional email response in {language} using only the documentation provided above."
+            user_prompt += f"\nRespond in {language} using only the documentation above. Format your response with clear Question and Answer sections for each question."
+            
+            # Add instruction when custom regards are provided
+            if query_regards:
+                user_prompt += f"\n\nUse clear Q&A format. Do not add any closing text. Stop after answering."
 
             # Create API payload
             data = self.create_mistral_payload(system_prompt, user_prompt, max_tokens=800)
@@ -381,8 +402,9 @@ Generate a professional acknowledgment response thanking {sender_name} for their
             
             response_data = response.json()
             
-            # Add query_regards if provided and no template
-            if not template and query_regards:
+            # Add custom regards if provided
+            if query_regards:
+                logger.info(f"query_regards : {query_regards}")
                 content = response_data['message']['content'].strip()
                 content = content + f"\n\n{query_regards}"
                 response_data['message']['content'] = content

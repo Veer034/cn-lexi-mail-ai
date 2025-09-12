@@ -278,13 +278,29 @@ Answer using document info only."""
 
     async def generate_complaint_response(self, sender_name: str, email_content: str, 
                                         documents: List[Dict], language: str, 
-                                         template: str = None, 
+                                        template: str = None, 
                                         complaint_regards: str = None) -> str:
         """Generate complaint response with template and custom regards support"""
         try:
-            # Build system prompt based on template availability
+            # Build system prompt based on template and regards availability
             if template:
-                system_prompt = f"""You are a professional customer service AI assistant responding to complaints in {language}.
+                if complaint_regards:
+                    system_prompt = f"""You are a professional customer service AI assistant responding to complaints in {language}.
+
+    Generate an empathetic complaint response following this template format:
+    {template}
+
+    IMPORTANT INSTRUCTIONS:
+    - Use the provided document information to address the complaint appropriately
+    - Maintain the template structure while incorporating relevant solutions
+    - Show empathy and understanding for the customer's concerns
+    - DO NOT include any closing remarks, signatures, or regards at the end
+    - Stop immediately after delivering the main response content
+    - The user will add their own custom closing separately
+
+    Respond entirely in {language}."""
+                else:
+                    system_prompt = f"""You are a professional customer service AI assistant responding to complaints in {language}.
 
     Generate an empathetic complaint response following this template format:
     {template}
@@ -301,7 +317,9 @@ Answer using document info only."""
     1. Sincere apology and acknowledgment of {sender_name}'s concerns
     2. Address the complaint using provided document information
     3. Offer solutions or next steps based on available information
-    4. DO NOT add any closing or regards section - stop after providing solutions
+
+    IMPORTANT: DO NOT include any closing remarks, signatures, or regards at the end.
+    Stop immediately after providing the solutions. The user will add their own custom closing.
 
     Show genuine empathy and take responsibility where appropriate.
     Respond entirely in {language}."""
@@ -334,6 +352,10 @@ Answer using document info only."""
                 user_prompt += "No specific resolution information available in knowledge base.\n"
 
             user_prompt += f"\nGenerate empathetic complaint response in {language} addressing {sender_name}'s concerns."
+            
+            # Add additional instruction when custom regards are provided
+            if complaint_regards:
+                user_prompt += "\nRemember: Do not add any closing or regards - stop after the main content."
 
             # Check token usage
             estimated_tokens = self.estimate_tokens(system_prompt + user_prompt)
@@ -360,8 +382,8 @@ Answer using document info only."""
             response_data = response.json()
             content = response_data['message']['content']
             
-            # Add complaint_regards if provided and no template
-            if not template and complaint_regards:
+            # Add custom regards if provided (regardless of template usage)
+            if complaint_regards:
                 content = content.strip() + f"\n\n{complaint_regards}"
             
             return content
@@ -369,6 +391,7 @@ Answer using document info only."""
         except Exception as e:
             logger.error(f"Error generating complaint response: {str(e)}", exc_info=True)
             return "We sincerely apologize for the inconvenience. We are looking into your concerns and will respond promptly."
+
 
     async def generate_ticket_data(self, sender_name: str, complaints: List[str], 
                              suggestions: List[Dict], language: str) -> Optional[TicketData]:

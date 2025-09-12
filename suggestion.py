@@ -45,8 +45,8 @@ class SuggestionProcessor:
 
     
     async def _extract_suggestions_with_mistral(self, email_content: str, type: str, 
-                                          subType: Optional[str], 
-                                          language: str) -> List[str]:
+                                        subType: Optional[str], 
+                                        language: str) -> List[str]:
         """
         Use Mistral AI to extract suggestions from email content with token optimization
         """
@@ -61,24 +61,17 @@ class SuggestionProcessor:
         
         system_prompt = f"""Extract customer suggestions from email in {language}.
 
-    RULES:
-    1. Extract ONLY explicit suggestions and recommendations
-    2. Focus on improvement ideas and constructive feedback
-    3. Consider {type_context}.
-    4. Return JSON array: ["suggestion1", "suggestion2", ...]
-    5. If no suggestions, return empty array"""
+    Extract only explicit suggestions and recommendations for improvements.
+
+    Return a simple JSON array format: ["suggestion1", "suggestion2", "suggestion3"]
+
+    If no suggestions found, return: []
+
+    Focus on actual improvement ideas and constructive feedback."""
         
-        user_prompt = f"""EMAIL: {email_content}
+        user_prompt = f"""Email content: {email_content}
 
-    Extract suggestions and recommendations for improvements.
-
-    Focus on:
-    - Explicit suggestions for improvement
-    - New feature recommendations  
-    - Constructive feedback as suggestions
-    - Ideas specific to {type} {f'and {subType}' if subType else ''}
-
-    Return JSON array of suggestion strings."""
+    Extract suggestions for improvements. Return JSON array only."""
         
         # Check token usage
         estimated_tokens = self.estimate_tokens(system_prompt + user_prompt)
@@ -126,15 +119,29 @@ class SuggestionProcessor:
             logger.info(f"Cleaned content: {cleaned_content}")
             
             # Parse the JSON
-            suggestions = json.loads(cleaned_content)
+            parsed_data = json.loads(cleaned_content)
+            
+            # Handle both direct array and object with suggestions key
+            if isinstance(parsed_data, list):
+                # Direct array format: ["suggestion1", "suggestion2"]
+                suggestions = parsed_data
+            elif isinstance(parsed_data, dict) and "suggestions" in parsed_data:
+                # Object format: {"suggestions": ["suggestion1", "suggestion2"]}
+                suggestions = parsed_data["suggestions"]
+            else:
+                logger.error(f"Unexpected JSON format: {parsed_data}")
+                return []
             
             # Validate that suggestions is a list
             if not isinstance(suggestions, list):
                 logger.error(f"Expected list but got {type(suggestions)}: {suggestions}")
                 return []
-                
-            logger.info(f"Extracted suggestions: {suggestions}")
-            return suggestions
+            
+            # Filter out empty strings and ensure all items are strings
+            valid_suggestions = [s.strip() for s in suggestions if isinstance(s, str) and s.strip()]
+            
+            logger.info(f"Extracted suggestions: {valid_suggestions}")
+            return valid_suggestions
             
         except json.JSONDecodeError as e:
             logger.error(f"JSON decode error: {e}")
@@ -148,8 +155,9 @@ class SuggestionProcessor:
                     json_str = json_match.group(0)
                     suggestions = json.loads(json_str)
                     if isinstance(suggestions, list):
-                        logger.info(f"Extracted suggestions via regex: {suggestions}")
-                        return suggestions
+                        valid_suggestions = [s.strip() for s in suggestions if isinstance(s, str) and s.strip()]
+                        logger.info(f"Extracted suggestions via regex: {valid_suggestions}")
+                        return valid_suggestions
             except Exception as fallback_error:
                 logger.error(f"Fallback regex extraction failed: {fallback_error}")
             
@@ -166,51 +174,72 @@ class SuggestionProcessor:
                                         suggestion_regards: str = None) -> str:
         """Generate acknowledgment response for suggestions with template and custom regards support"""
         try:
-            # Build system prompt based on template availability
+            # Build system prompt based on template and regards availability
             if template:
-                system_prompt = f"""You are a professional customer service AI assistant responding to customer suggestions in {language}.
+                if suggestion_regards:
+                    system_prompt = f"""You are a customer service assistant responding to suggestions in {language}.
 
-    Generate a professional suggestion acknowledgment response following this template format:
+    Follow this template:
     {template}
 
-    Use the provided suggestions to fill the content appropriately.
-    Show appreciation for the customer's feedback and suggestions.
-    Maintain the template structure while expressing gratitude.
-    Respond entirely in {language}."""
+    Rules:
+    - Use the provided suggestions to fill content appropriately
+    - Show appreciation for customer feedback and suggestions
+    - Maintain template structure while expressing gratitude
+    - Do not add any closing text or signatures
+    - Stop immediately after main content
+
+    Respond in {language}."""
+                else:
+                    system_prompt = f"""You are a customer service assistant responding to suggestions in {language}.
+
+    Follow this template:
+    {template}
+
+    Rules:
+    - Use the provided suggestions to fill content appropriately
+    - Show appreciation for customer feedback and suggestions
+    - Maintain template structure while expressing gratitude
+
+    Respond in {language}."""
             else:
                 if suggestion_regards:
-                    system_prompt = f"""You are a professional customer service AI assistant responding to customer suggestions in {language}.
+                    system_prompt = f"""You are a customer service assistant responding to suggestions in {language}.
 
-    Generate a professional suggestion acknowledgment response with:
+    Write a professional acknowledgment response:
     1. Thank {sender_name} for taking time to provide suggestions
     2. Acknowledge the specific suggestions they made
     3. Assure them the company will review and consider their suggestions
     4. Express appreciation for their continued engagement
-    5. DO NOT add any closing, regards, or signature - stop immediately after expressing appreciation
 
-    Be polite, professional, and appreciative.
-    Do NOT promise specific implementations or timelines.
-    Respond entirely in {language}."""
+    Rules:
+    - Be polite, professional, and appreciative
+    - Do not promise specific implementations or timelines
+    - Do not add any closing text or signatures
+    - Stop immediately after expressing appreciation
+
+    Respond in {language}."""
                 else:
-                    system_prompt = f"""You are a professional customer service AI assistant responding to customer suggestions in {language}.
+                    system_prompt = f"""You are a customer service assistant responding to suggestions in {language}.
 
-    Generate a professional suggestion acknowledgment response with:
+    Write a professional acknowledgment response:
     1. Thank {sender_name} for taking time to provide suggestions
     2. Acknowledge the specific suggestions they made
     3. Assure them the company will review and consider their suggestions
     4. Express appreciation for their continued engagement
-    5. Professional closing offering further assistance
+    5. End with offer for further assistance
 
-    Be polite, professional, and appreciative.
-    Do NOT promise specific implementations or timelines.
-    Respond entirely in {language}."""
+    Rules:
+    - Be polite, professional, and appreciative
+    - Do not promise specific implementations or timelines
+
+    Respond in {language}."""
 
             # Build user prompt with suggestions
-            user_prompt = f"""CUSTOMER EMAIL:
-    From: {sender_name}
-    Content: {email_content}
+            user_prompt = f"""Customer: {sender_name}
+    Message: {email_content}
 
-    SUGGESTIONS PROVIDED:
+    Suggestions provided:
     """
             
             if suggestions:
@@ -219,11 +248,11 @@ class SuggestionProcessor:
             else:
                 user_prompt += "No specific suggestions identified.\n"
 
-            user_prompt += f"\nGenerate professional acknowledgment response in {language} thanking {sender_name} for their suggestions."
+            user_prompt += f"\nRespond in {language} thanking {sender_name} for their suggestions."
             
-            # Add specific instruction for suggestion_regards case
+            # Add instruction when custom regards are provided
             if suggestion_regards:
-                user_prompt += " DO NOT add any closing or regards - end after expressing appreciation."
+                user_prompt += " Do not add any closing text. Stop after expressing appreciation."
 
             # Check token usage
             estimated_tokens = self.estimate_tokens(system_prompt + user_prompt)
@@ -259,16 +288,15 @@ class SuggestionProcessor:
                 content = re.sub(r'\n```$', '', content)
             content = content.strip()
             
-            # Add suggestion_regards if provided and no template
-            if not template and suggestion_regards:
+            # Add custom regards if provided (regardless of template usage)
+            if suggestion_regards:
                 content = content.strip() + f"\n\n{suggestion_regards}"
             
             return content
             
         except Exception as e:
             logger.error(f"Error generating suggestion response: {str(e)}", exc_info=True)
-            return f"Thank you for your suggestions, {sender_name}. We will review them carefully and appreciate your feedback."   
-
+            return f"Thank you for your suggestions, {sender_name}. We will review them carefully and appreciate your feedback."
 
     def _create_suggestion_system_prompt(self, language: str, suggestion_ai_mode: str = None, template: str = None) -> str:
         """Create system prompt for suggestion acknowledgment responses"""
