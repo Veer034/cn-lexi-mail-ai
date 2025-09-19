@@ -1,7 +1,8 @@
 import json
 import httpx
 import re
-import logging
+import torch
+import numpy as np
 import datetime
 import asyncio
 from typing import List, Dict, Any, Optional
@@ -25,6 +26,7 @@ class ComplaintProcessor:
         """
         self.es_client = es_client
         self.embedding_model = embedding_model
+        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         
 
     async def extract_complaints(self, tenant_id: str, email_content: str, language: str) -> Dict:
@@ -53,22 +55,15 @@ class ComplaintProcessor:
             # Perform vector search for each complaint
             advice_list = []
             
-            metadata_filters = {}
-            if language and language != "unknown":
-                metadata_filters["language"] = language
-            
             # Search using related queries for additional context
             for query in related_queries:
-                query_embedding = await self.generate_embeddings(query)
                 
                 # Use the vector_search method
-                query_results = await self.vector_search(
-                    embedding=query_embedding,
+                query_results = await self.search_knowledge_base(
+                    question=query,
                     tenant_id=tenant_id,
-                    top_k=2,
-                    threshold=0.65,
-                    metadata_filters=metadata_filters
-                )
+                    language=language
+                    )
                 
                 logger.info(f"Query results: {query_results}")
             
@@ -276,10 +271,11 @@ Answer using document info only."""
             logger.error(f"Error processing advice response: {e}")
             return document_content
 
+   
     async def generate_complaint_response(self, sender_name: str, email_content: str, 
-                                        documents: List[Dict], language: str, 
-                                        template: str = None, 
-                                        complaint_regards: str = None) -> str:
+                                    documents: List[Dict], language: str, 
+                                    template: str = None, 
+                                    complaint_regards: str = None) -> str:
         """Generate complaint response with template and custom regards support"""
         try:
             # Build system prompt based on template and regards availability
@@ -290,13 +286,15 @@ Answer using document info only."""
     Generate an empathetic complaint response following this template format:
     {template}
 
-    IMPORTANT INSTRUCTIONS:
+    CRITICAL INSTRUCTIONS:
     - Use the provided document information to address the complaint appropriately
     - Maintain the template structure while incorporating relevant solutions
     - Show empathy and understanding for the customer's concerns
-    - DO NOT include any closing remarks, signatures, or regards at the end
+    - ABSOLUTELY DO NOT include any closing remarks, signatures, regards, or greetings at the end
+    - DO NOT add any closing phrases or farewell expressions in any language
+    - DO NOT add contact information, names, or signatures
     - Stop immediately after delivering the main response content
-    - The user will add their own custom closing separately
+    - End your response with a period after the last sentence of actual content
 
     Respond entirely in {language}."""
                 else:
@@ -308,6 +306,7 @@ Answer using document info only."""
     Use the provided document information to address the complaint appropriately.
     Maintain the template structure while incorporating relevant solutions.
     Show empathy and understanding for the customer's concerns.
+    Include appropriate professional closing.
     Respond entirely in {language}."""
             else:
                 if complaint_regards:
@@ -318,10 +317,14 @@ Answer using document info only."""
     2. Address the complaint using provided document information
     3. Offer solutions or next steps based on available information
 
-    IMPORTANT: DO NOT include any closing remarks, signatures, or regards at the end.
-    Stop immediately after providing the solutions. The user will add their own custom closing.
+    CRITICAL INSTRUCTIONS:
+    - Show genuine empathy and take responsibility where appropriate
+    - ABSOLUTELY DO NOT include any closing remarks, signatures, regards, or greetings at the end
+    - DO NOT add any closing phrases or farewell expressions in any language
+    - DO NOT add contact information, names, or signatures
+    - Stop immediately after providing the solutions
+    - End your response with a period after the last sentence of actual content
 
-    Show genuine empathy and take responsibility where appropriate.
     Respond entirely in {language}."""
                 else:
                     system_prompt = f"""You are a professional customer service AI assistant responding to complaints in {language}.
@@ -355,7 +358,7 @@ Answer using document info only."""
             
             # Add additional instruction when custom regards are provided
             if complaint_regards:
-                user_prompt += "\nRemember: Do not add any closing or regards - stop after the main content."
+                user_prompt += f"\nCRITICAL: Do not add any closing phrases or farewell expressions in {language} - stop after the main content."
 
             # Check token usage
             estimated_tokens = self.estimate_tokens(system_prompt + user_prompt)
@@ -365,6 +368,7 @@ Answer using document info only."""
             # Create API payload
             data = self.create_mistral_payload(system_prompt, user_prompt, max_tokens=800)
             data["model"] = MISTRAL_CONFIG['model']
+            data["temperature"] = 0.0  # Set to 0 for consistent responses
             
             # Call API
             async with httpx.AsyncClient() as client:
@@ -391,7 +395,6 @@ Answer using document info only."""
         except Exception as e:
             logger.error(f"Error generating complaint response: {str(e)}", exc_info=True)
             return "We sincerely apologize for the inconvenience. We are looking into your concerns and will respond promptly."
-
 
     async def generate_ticket_data(self, sender_name: str, complaints: List[str], 
                              suggestions: List[Dict], language: str) -> Optional[TicketData]:
@@ -622,26 +625,302 @@ Answer using document info only."""
             return []
 
 
-    async def generate_embeddings(self, query: str) -> List[List[float]]:
-        """Generate embeddings for a query using a thread pool"""
+    async def search_knowledge_base(self, question: str, tenant_id: str, language: str) -> List[Dict[str, Any]]:
+        """
+        Search Elasticsearch for relevant documents using vector search
+        
+        Args:
+            question (str): The question to search for
+            tenant_id (str): The tenant ID (compulsory field)
+            language (str, optional): The language of the question for potential language-specific handling
+            
+        Returns:
+            List[Dict[str, Any]]: List of relevant documents
+        """
+        try:
+            # Step 1: Generate embedding for the question
+            embeddings = await self.generate_embeddings(question)
+            if not embeddings or len(embeddings) == 0:
+                logger.error("Failed to generate embeddings for the question")
+                return []
+            
+            # Step 2: Prepare metadata filters if needed (e.g., language-specific filtering)
+            metadata_filters = {}
+            if language and language != "unknown":
+                metadata_filters["language"] = language
+            
+            
+            
+            # Step 3: Perform vector search
+            search_results = await self.search_elasticsearch_with_enhanced_chunking(
+                embedding=embeddings,  # Get the first embedding
+                tenant_id=tenant_id,
+                top_k=3,  # Get top 3 results as in original function
+                threshold=0.55,  # Cosine similarity threshold
+                metadata_filters=metadata_filters,include_context= True
+            )
+        
+            return search_results
+        except Exception as e:
+            logger.error(f"Error searching knowledge base with vector search: {str(e)}", exc_info=True)
+            return []
+
+
+    async def search_elasticsearch_with_enhanced_chunking(
+        self, 
+        embedding: List[float], 
+        tenant_id: str, 
+        top_k: int = 5, 
+        threshold: float = 0.55,
+        metadata_filters: Optional[Dict[str, Any]] = None,
+        include_context: bool = True,
+        original_query: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Enhanced search that works with improved chunking but keeps interface simple
+        """
+        try:
+            # Build basic filter conditions
+            filter_conditions = [{"term": {"tenantId": tenant_id}}]
+            
+            # Add metadata filters if provided
+            if metadata_filters:
+                for key, value in metadata_filters.items():
+                    if isinstance(value, list):
+                        filter_conditions.append({"terms": {f"metadata.{key}": value}})
+                    else:
+                        filter_conditions.append({"term": {f"metadata.{key}": value}})
+            
+            # Build query - hybrid if we have original text, semantic-only otherwise
+            if original_query:
+                # Hybrid search: semantic + keyword (simple version)
+                query = {
+                    "query": {
+                        "bool": {
+                            "filter": filter_conditions,
+                            "should": [
+                                # Semantic search with normalized scoring
+                                {
+                                    "script_score": {
+                                        "query": {"match_all": {}},
+                                        "script": {
+                                            "source": "Math.max(0, (cosineSimilarity(params.query_vector, 'contentVector') + 1.0) / 2.0)",
+                                            "params": {"query_vector": embedding}
+                                        },
+                                        "boost": 2.0
+                                    }
+                                },
+                                # Simple keyword search
+                                {
+                                    "multi_match": {
+                                        "query": original_query,
+                                        "fields": ["content^2", "keywords^1.5", "sectionTitle"],
+                                        "type": "best_fields",
+                                        "boost": 1.0
+                                    }
+                                },
+                                # Boost FAQ content for question-like queries
+                                {
+                                    "bool": {
+                                        "must": [
+                                            {"wildcard": {"chunkType": "*faq*"}},
+                                            {"match": {"content": original_query}}
+                                        ],
+                                        "boost": 1.5 if self._is_question(original_query) else 1.0
+                                    }
+                                }
+                            ],
+                            "minimum_should_match": 1
+                        }
+                    },
+                    "_source": ["content", "documentId", "chunkPosition", "totalChunks", "chunkType"]
+                }
+            else:
+                # Semantic-only search
+                query = {
+                    "query": {
+                        "script_score": {
+                            "query": {
+                                "bool": {
+                                    "filter": filter_conditions
+                                }
+                            },
+                            "script": {
+                                "source": "Math.max(0, (cosineSimilarity(params.query_vector, 'contentVector') + 1.0) / 2.0)",
+                                "params": {"query_vector": embedding}
+                            }
+                        }
+                    },
+                    "_source": ["content", "documentId", "chunkPosition", "totalChunks",  "chunkType"]
+                }
+
+            logger.info(f"Enhanced search with original_query: {bool(original_query)}")
+            
+            # Execute search
+            response = await self.es_client.search(
+                index=ES_CONFIG['tenant_document_index_name'],
+                body=query,
+                size=top_k
+            )
+            
+            # Process results - keep it simple
+            results = []
+            
+            if include_context:
+                # Get chunks with basic adjacent context (existing logic)
+                for hit in response['hits']['hits']:
+                    score = hit['_score']
+                    if score >= threshold:
+                        enhanced_content = await self._get_chunk_with_adjacent_context(
+                            hit['_source'], 
+                            tenant_id
+                        )
+                        content = enhanced_content.get('content') or ""
+                        content = content.replace("\n", " ").strip()
+                       
+                        results.append({
+                            "content": content,
+                            "url": hit['_source'].get('url', None),
+                            "score": score
+                        })
+            else:
+                # Simple content only
+                for hit in response['hits']['hits']:
+                    score = hit['_score']
+                    if score >= threshold:
+                        content = hit['_source'].get('content') or ""
+                        content = content.replace("\n", " ").strip()
+
+                        results.append({
+                            "content": content,
+                            "url": hit['_source'].get('url', None),
+                            "score": score
+                        })
+            
+            return results
+            
+        except Exception as e:
+            logger.error(f"Error searching Elasticsearch: {str(e)}", exc_info=True)
+            raise
+
+    async def _get_chunk_with_adjacent_context(
+            self, 
+            chunk_source: Dict[str, Any], 
+            tenant_id: str
+        ) -> Dict[str, Any]:
+        """
+        Get chunk content with adjacent context - simplified version
+        """
+        try:
+            document_id = chunk_source.get('documentId')
+            current_position = chunk_source.get('chunkPosition', 0)
+            total_chunks = chunk_source.get('totalChunks', 1)
+            
+            base_content = {
+                'content': chunk_source['content'],
+            }
+            
+            # Only get adjacent context if we have multiple chunks and it's not already consolidated
+            chunk_type = chunk_source.get('chunkType', '')
+            if total_chunks > 1 and not chunk_type.endswith('_consolidated'):
+                # Get previous and next chunk for context
+                adjacent_positions = []
+                if current_position > 0:
+                    adjacent_positions.append(current_position - 1)
+                if current_position < total_chunks - 1:
+                    adjacent_positions.append(current_position + 1)
+                
+                if adjacent_positions:
+                    adjacent_query = {
+                        "query": {
+                            "bool": {
+                                "must": [
+                                    {"term": {"tenantId": tenant_id}},
+                                    {"term": {"documentId": document_id}},
+                                    {"terms": {"chunkPosition": adjacent_positions}}
+                                ]
+                            }
+                        },
+                        "_source": ["content", "chunkPosition"],
+                        "sort": [{"chunkPosition": {"order": "asc"}}],
+                        "size": 2
+                    }
+                    
+                    try:
+                        adjacent_response = await self.es_client.search(
+                            index=ES_CONFIG['tenant_document_index_name'],
+                            body=adjacent_query
+                        )
+                        
+                        # Simple context addition
+                        context_parts = [base_content['content']]
+                        
+                        for hit in adjacent_response['hits']['hits']:
+                            pos = hit['_source']['chunkPosition']
+                            content = hit['_source']['content']
+                            
+                            if pos < current_position:
+                                context_parts.insert(0, content[-200:])  # Previous context
+                            elif pos > current_position:
+                                context_parts.append(content[:200])     # Next context
+                        
+                        # Combine with simple separators
+                        if len(context_parts) > 1:
+                            base_content['content'] = ' ... '.join(context_parts)
+                            
+                    except Exception as e:
+                        logger.warning(f"Could not fetch adjacent context: {str(e)}")
+            
+            return base_content
+            
+        except Exception as e:
+            logger.error(f"Error getting chunk with context: {str(e)}")
+            return {
+                'content': chunk_source.get('content', '')
+            }
+
+     
+
+    async def generate_embeddings(self, query: str) -> List[float]:
+        """Generate embeddings for a list of queries using a thread pool"""
         try:
             start_time = datetime.datetime.now()
             
             # Move the embedding generation to a separate thread 
             # since SentenceTransformer is not async-compatible
-            embeddings = await asyncio.to_thread(self._generate_embeddings_sync, query)
+            embeddings = await asyncio.to_thread(self._generate_embeddings_sync_optimized, query)
             
             end_time = datetime.datetime.now()
-            logger.info(f"Generated {len(query)} complaint embeddings in {(end_time - start_time).total_seconds()} seconds")
+            logger.info(f"Generated {len(query)} embeddings in {(end_time - start_time).total_seconds()} seconds")
             return embeddings
         except Exception as e:
-            logger.error(f"Error generating complaint embeddings: {str(e)}", exc_info=True)
+            logger.error(f"Error generating embeddings: {str(e)}", exc_info=True)
             raise
-    
-    def _generate_embeddings_sync(self, query: str) -> List[List[float]]:
-        """Synchronous method to generate embeddings (runs in a thread)"""
-        embeddings = self.embedding_model.encode(query)
-        return embeddings.tolist()
+
+    def _generate_embeddings_sync_optimized(self, query: str) -> List[float]:
+        """Optimized synchronous embedding generation"""
+        try:
+            # Performance optimizations
+            with torch.no_grad():  # Disable gradient computation
+                embeddings = self.embedding_model.encode(
+                    query,
+                    show_progress_bar=False,  # Disable progress bar for single queries
+                    convert_to_numpy=True,    # Direct numpy conversion
+                    normalize_embeddings=True,  # Normalize for cosine similarity
+                    batch_size=1,            # Single query batch
+                    device=self.device       # Explicit device specification
+                )
+            
+            # Convert to list efficiently
+            if isinstance(embeddings, np.ndarray):
+                return embeddings.tolist()
+            else:
+                return embeddings
+                
+        except Exception as e:
+            logger.error(f"❌ Error in sync embedding generation: {str(e)}")
+            raise
+
 
 
     def estimate_tokens(self,text: str) -> int:

@@ -186,7 +186,7 @@ class SuggestionProcessor:
     - Use the provided suggestions to fill content appropriately
     - Show appreciation for customer feedback and suggestions
     - Maintain template structure while expressing gratitude
-    - Do not add any closing text or signatures
+    - NEVER add closing text, regards, signatures, or names like [Your Name]
     - Stop immediately after main content
 
     Respond in {language}."""
@@ -215,7 +215,7 @@ class SuggestionProcessor:
     Rules:
     - Be polite, professional, and appreciative
     - Do not promise specific implementations or timelines
-    - Do not add any closing text or signatures
+    - NEVER add closing text, regards, signatures, or names like [Your Name]
     - Stop immediately after expressing appreciation
 
     Respond in {language}."""
@@ -250,9 +250,8 @@ class SuggestionProcessor:
 
             user_prompt += f"\nRespond in {language} thanking {sender_name} for their suggestions."
             
-            # Add instruction when custom regards are provided
             if suggestion_regards:
-                user_prompt += " Do not add any closing text. Stop after expressing appreciation."
+                user_prompt += " Do not add any closing text."
 
             # Check token usage
             estimated_tokens = self.estimate_tokens(system_prompt + user_prompt)
@@ -262,7 +261,7 @@ class SuggestionProcessor:
             # Create API payload
             data = self.create_mistral_payload(system_prompt, user_prompt, max_tokens=600)
             data["model"] = MISTRAL_CONFIG['model']
-            data["temperature"] = 0.3
+            data["temperature"] = 0.0
             
             # Call API
             async with httpx.AsyncClient() as client:
@@ -278,19 +277,12 @@ class SuggestionProcessor:
                 return f"Thank you for your suggestions, {sender_name}. We will review them carefully and appreciate your feedback."
             
             response_data = response.json()
-            content = response_data['message']['content']
+            content = response_data['message']['content'].strip()
             
-            # Clean any markdown formatting
-            content = content.strip()
-            if content.startswith('```'):
-                content = re.sub(r'^```.*?\n', '', content)
-            if content.endswith('```'):
-                content = re.sub(r'\n```$', '', content)
-            content = content.strip()
-            
-            # Add custom regards if provided (regardless of template usage)
+            # Remove closing text if custom regards will be added
             if suggestion_regards:
-                content = content.strip() + f"\n\n{suggestion_regards}"
+                content = re.sub(r'\n\n?(best regards|regards|sincerely|\[.*\]).*$', '', content, flags=re.IGNORECASE | re.MULTILINE).strip()
+                content = content + f"\n\n{suggestion_regards}"
             
             return content
             

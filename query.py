@@ -1,7 +1,8 @@
 import json
 import re
 import httpx
-import logging
+import torch
+import numpy as np
 import datetime
 import asyncio
 from typing import List, Dict, Any, Optional, Set
@@ -24,6 +25,7 @@ class QueryProcessor:
         """
         self.es_client = es_client
         self.embedding_model = embedding_model
+        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         
 
     async def extract_query_generate_responses(self, tenant_id: str, thread_id:str, sender_name:str, email_content: str, language: str, type: str, subtype: Optional[str] = None, query_ai_mode: str = None, template: str = None, query_regards: str= None) -> Dict[str,Any]:
@@ -41,34 +43,40 @@ class QueryProcessor:
         
         # query_response is already a dictionary, no need to parse JSON
         return query_response
-
+    
     async def generate_no_questions_response(self, sender_name: str, email_content: str, 
-                                           language: str, query_ai_mode: str = None, 
-                                           template: str = None) -> Dict[str, Any]:
+                                        language: str, query_ai_mode: str = None, 
+                                        template: str = None) -> Dict[str, Any]:
         """
         Generate professional response when no questions are found
         """
         try:
-            system_prompt = f"""You are a professional customer service AI assistant responding in {language}.
+            system_prompt = f"""You are a customer service representative responding in {language}.
 
-Generate a polite, professional email response that:
-1. Thanks the customer for their email
-2. Acknowledges receipt of their message
-3. Mentions that if they have specific questions, they're welcome to ask
-4. Maintains a helpful and courteous tone
-5. Ends with professional closing
+    Write a warm, professional email response that:
+    1. Thanks {sender_name} for reaching out
+    2. Acknowledges you received their message
+    3. Shows you understand their communication
+    4. Offers assistance for any future questions
+    5. Maintains a helpful and friendly tone
 
-Respond directly in {language} language with a complete email response."""
+    Style guidelines:
+    - Write as "I" or "we" (representing the company)
+    - Be conversational and warm, not robotic
+    - Sound like a real person responding
+    - Keep it concise but genuine
 
-            user_prompt = f"""CUSTOMER EMAIL:
-From: {sender_name}
-Content: {email_content}
+    Respond directly in {language}."""
 
-Generate a professional acknowledgment response thanking {sender_name} for their email and letting them know we're here to help with any questions they may have."""
+            user_prompt = f"""Customer: {sender_name}
+    Customer's message: {email_content}
+
+    Write a natural, friendly acknowledgment response that shows you received and appreciate their email. Let them know you're available to help with any questions they might have."""
 
             # Create API payload
-            data = self.create_mistral_payload(system_prompt, user_prompt, max_tokens=400)
+            data = self.create_mistral_payload(system_prompt, user_prompt, max_tokens=300)
             data["model"] = MISTRAL_CONFIG['model']
+            data["temperature"] = 0.2  # Natural language
             
             # Call API
             async with httpx.AsyncClient() as client:
@@ -81,14 +89,13 @@ Generate a professional acknowledgment response thanking {sender_name} for their
             
             if response.status_code != 200:
                 logger.error(f"Mistral API error: {response.status_code}")
-                return {"message": {"content": f"Thank you for your email, {sender_name}. We appreciate you reaching out to us."}}
+                return {"message": {"content": f"Hi {sender_name},\n\nThank you for your email. I received your message and appreciate you reaching out to us. If you have any questions or need assistance with anything, please don't hesitate to let me know.\n\nI'm here to help!"}}
             
             return response.json()
             
         except Exception as e:
             logger.error(f"Error generating no-questions response: {str(e)}")
-            return {"message": {"content": f"Thank you for your email, {sender_name}. We appreciate you reaching out to us."}}
-
+            return {"message": {"content": f"Hi {sender_name},\n\nThank you for your email. I received your message and appreciate you reaching out to us. If you have any questions or need assistance with anything, please don't hesitate to let me know.\n\nI'm here to help!"}}
 
     async def extract_multiple_questions(self, email_content: str, language: str, type: str, subtype: Optional[str] = None):
         """
@@ -103,29 +110,47 @@ Generate a professional acknowledgment response thanking {sender_name} for their
         Returns:
             List[str]: A list of extracted questions
         """
-        system_prompt = """You are a multilingual email analysis assistant specialized in identifying questions. 
-    Your task is to find and extract ONLY the explicit questions in an email.
+        system_prompt = """You are a multilingual email analysis assistant specialized in identifying questions with precision and consistency across all languages.
 
-    An explicit question is a sentence that directly asks for information, permission, or action.
-    Statements expressing needs (like "I need help") are NOT questions unless phrased as questions.
+    Your task is to find and extract questions from emails - including direct questions, information requests, and polite inquiries that seek specific information or action.
 
-    Be careful to only extract ACTUAL questions from the provided email, nothing else."""
+    WHAT TO EXTRACT:
+    1. Direct questions using interrogative words in any language
+    2. Sentences with question punctuation (varies by language)
+    3. Polite requests that ask for specific information or action
+    4. Information-seeking statements that clearly request answers
+
+    WHAT NOT TO EXTRACT:
+    1. General statements of need or desire that don't ask questions
+    2. Statements of preference that don't seek information
+    3. Greetings, thanks, or social pleasantries
+    4. Confirmations or acknowledgments
+
+    IMPORTANT: Analyze BOTH the subject line AND the email body - questions can appear in either location.
+
+    Work with any language and writing system. Be consistent across all languages."""
         
         context_description = f"{type}" + (f", subtype: {subtype}" if subtype else "")
         
         user_prompt = f"""
-    ORIGINAL EMAIL:
-    {email_content}
+    EMAIL TO ANALYZE:
+    Subject: {email_content.split('Body:')[0].replace('Subject:', '').strip() if 'Subject:' in email_content else 'No subject'}
+    Body: {email_content.split('Body:')[1].strip() if 'Body:' in email_content else email_content}
 
     TASK:
-    Analyze the above email of type {context_description} and in {language} language. Extract ONLY the explicit questions.
-    Do not consider statements of need or general expressions of desire as questions.
+    Analyze BOTH the subject line AND body of this {context_description} email in {language} language.
 
-    Return your response as a JSON array of strings containing ONLY questions found in the ORIGINAL EMAIL:
-    []
+    Extract questions that ask for information, action, or clarification from BOTH subject and body:
+    - Direct questions (What plans are available?)
+    - Information requests (Please provide contact details)
+    - Polite inquiries seeking specific answers
 
-    If no questions are found, return an empty array.
-    """
+    DO NOT extract general statements like "I need..." or "I am looking for..." unless they're phrased as actual questions.
+
+    Return a clean JSON array:
+    ["question from subject or body", "another question"]
+
+    If no questions found, return: []"""
         
         # Call Mistral API
         data = {
@@ -135,8 +160,8 @@ Generate a professional acknowledgment response thanking {sender_name} for their
                 {"role": "user", "content": user_prompt}
             ],
             "stream": False,
-            "max_tokens": 500,
-            "temperature": 0.1  # Lower temperature for more deterministic output
+            "max_tokens": 400,  # Reduced to encourage conciseness
+            "temperature": 0.05  # Even lower for maximum consistency
         }
         
         async with httpx.AsyncClient() as client:
@@ -182,6 +207,11 @@ Generate a professional acknowledgment response thanking {sender_name} for their
             if not isinstance(questions, list):
                 logger.error(f"Expected list but got {type(questions)}: {questions}")
                 return []
+            
+            # Additional validation - limit to reasonable number of questions
+            if len(questions) > 10:  # Sanity check
+                logger.warning(f"Unusually high number of questions extracted: {len(questions)}, truncating to first 5")
+                questions = questions[:5]
                 
             logger.info(f"Extracted questions: {questions}")
             return questions
@@ -198,6 +228,9 @@ Generate a professional acknowledgment response thanking {sender_name} for their
                     json_str = json_match.group(0)
                     questions = json.loads(json_str)
                     if isinstance(questions, list):
+                        # Apply same validation
+                        if len(questions) > 10:
+                            questions = questions[:5]
                         logger.info(f"Extracted questions via regex: {questions}")
                         return questions
             except Exception as fallback_error:
@@ -234,7 +267,7 @@ Generate a professional acknowledgment response thanking {sender_name} for their
                 language=language
             )
             question_documents[question] = search_results
-        
+
         # Process questions in smaller batches that fit within Mistral's context limits
         return await self.process_questions(sender_name, email_content, question_documents, language,query_ai_mode,template,query_regards)
         
@@ -267,8 +300,6 @@ Generate a professional acknowledgment response thanking {sender_name} for their
         # Track which questions we're processing
         processed_questions = set()
         
-
-        logger.info(f"question_documents: {question_documents}")
 
         # Collect documents from all questions
         for question, documents in question_documents.items():
@@ -305,88 +336,111 @@ Generate a professional acknowledgment response thanking {sender_name} for their
         return await self.generate_query_response(sender_name, email_content, question_documents, language,template,query_regards)
 
     async def generate_query_response(self, sender_name: str, email_content: str, 
-                            question_documents: Dict[str, List[Dict]], 
-                            language: str, template: str = None, query_regards: str = None) -> Dict[str, Any]:
+                    question_documents: Dict[str, List[Dict]], 
+                    language: str, template: str = None, query_regards: str = None) -> Dict[str, Any]:
         """Generate structured query response with document-based answers"""
         try:
             # Build system prompt based on template and regards availability
             if template:
                 if query_regards:
-                    system_prompt = f"""You are a customer service assistant responding in {language}.
+                    system_prompt = f"""You are a customer service representative responding in {language}.
 
     Follow this template:
     {template}
 
     Rules:
-    - Use only information from provided documents
-    - If no information available, state that information is not available in documentation
-    - Do not add any closing text or signatures
-    - Stop immediately after answering
+    - Write as a helpful customer service agent speaking directly to the customer
+    - Use information from provided documents when available
+    - When information is not available, politely explain that you don't have that specific information at hand
+    - Speak in first person ("I", "we", "our company") rather than third person
+    - Be conversational and professional, not robotic
+    - DO NOT add any closing text, signatures, regards, or contact information
+    - DO NOT add any closing phrases or greetings at the end
+    - Stop immediately after answering the last question
 
     Respond in {language}."""
                 else:
-                    system_prompt = f"""You are a customer service assistant responding in {language}.
+                    system_prompt = f"""You are a customer service representative responding in {language}.
 
     Follow this template:
     {template}
 
     Rules:
-    - Use only information from provided documents
-    - If no information available, state that information is not available in documentation
+    - Write as a helpful customer service agent speaking directly to the customer
+    - Use information from provided documents when available
+    - When information is not available, politely explain that you don't have that specific information at hand
+    - Speak in first person ("I", "we", "our company") rather than third person
+    - Be conversational and professional, not robotic
+    - End with appropriate professional closing
 
     Respond in {language}."""
             else:
                 if query_regards:
-                    system_prompt = f"""You are a customer service assistant responding in {language}.
+                    system_prompt = f"""You are a customer service representative responding in {language}.
 
-    Write a response:
-    1. Thank {sender_name} for their message
-    2. Answer questions using only provided documents
-    3. If no information available, state that information is not available in documentation
+    Write a response that:
+    1. Thanks {sender_name} for reaching out
+    2. Answers their questions using available information
+    3. For missing information, politely explains you don't have those details readily available
+    4. Speaks naturally in first person as a real person would
 
-    Rules:
-    - Do not add any closing text or signatures
+    Style guidelines:
+    - Write as "I" or "we" (our team/company), not "the documentation says"
+    - Be warm, helpful, and conversational
+    - When you don't know something, say "I don't have that information available right now" instead of referring to documentation
+    - DO NOT add any closing text, signatures, regards, or contact information
+    - DO NOT add any closing phrases or greetings at the end
     - Stop immediately after the last answer
 
     Respond in {language}."""
                 else:
-                    system_prompt = f"""You are a customer service assistant responding in {language}.
+                    system_prompt = f"""You are a customer service representative responding in {language}.
 
-    Write a response:
-    1. Thank {sender_name} for their message
-    2. Answer questions using only provided documents  
-    3. If no information available, state that information is not available in documentation
-    4. End with offer to help further
+    Write a response that:
+    1. Thanks {sender_name} for reaching out
+    2. Answers their questions using available information  
+    3. For missing information, politely explains you don't have those details readily available
+    4. Offers to help further or connect them with someone who can assist
+    5. Speaks naturally in first person as a real person would
+
+    Style guidelines:
+    - Write as "I" or "we" (our team/company), not "the documentation says"
+    - Be warm, helpful, and conversational
+    - When you don't know something, say "I don't have that information available right now" instead of referring to documentation
+    - Sound like a real person helping another person
+    - End with appropriate professional closing
 
     Respond in {language}."""
 
-            # Build user prompt
+            # Build user prompt with better context
             user_prompt = f"""Customer: {sender_name}
-    Message: {email_content}
+    Customer's message: {email_content}
 
-    Questions and documentation:
+    Here are their questions with available information:
     """
             
             for i, (question, docs) in enumerate(question_documents.items(), 1):
                 user_prompt += f"\nQuestion {i}: {question}\n"
                 if docs and docs[0].get('content'):
-                    user_prompt += f"Information: {docs[0]['content'][:400]}\n"
+                    user_prompt += f"Available information: {docs[0]['content'][:400]}\n"
                     if docs[0].get('url'):
-                        user_prompt += f"Source: {docs[0]['url']}\n"
+                        user_prompt += f"Reference: {docs[0]['url']}\n"
                 else:
-                    user_prompt += "No documentation available.\n"
+                    user_prompt += "No specific information available for this question.\n"
 
-            user_prompt += f"\nRespond in {language} using only the documentation above. Format your response with clear Question and Answer sections for each question."
+            user_prompt += f"\nRespond naturally in {language} as a helpful customer service representative. Address each question conversationally, not in a formal Q&A format. When you don't have information, explain it naturally without mentioning 'documentation'."
             
             # Add instruction when custom regards are provided
             if query_regards:
-                user_prompt += f"\n\nUse clear Q&A format. Do not add any closing text. Stop after answering."
+                user_prompt += f"\n\nIMPORTANT: Do not add any closing text, regards, signatures, or closing phrases in {language}. Stop after answering all questions."
 
             # Create API payload
             data = self.create_mistral_payload(system_prompt, user_prompt, max_tokens=800)
             data["model"] = MISTRAL_CONFIG['model']
-            data["temperature"] = 0.1
+            data["temperature"] = 0.0  # Set to 0 for consistent responses
             
+            logger.info(f"question request : {data}")
+
             # Call API
             async with httpx.AsyncClient() as client:
                 response = await client.post(
@@ -401,6 +455,7 @@ Generate a professional acknowledgment response thanking {sender_name} for their
                 return {"error": "Sorry, I couldn't generate a response at this time."}
             
             response_data = response.json()
+            logger.info(f"query response : {response_data}")
             
             # Add custom regards if provided
             if query_regards:
@@ -414,7 +469,7 @@ Generate a professional acknowledgment response thanking {sender_name} for their
         except Exception as e:
             logger.error(f"Error generating query response: {str(e)}")
             return {"error": "Sorry, I couldn't generate a response at this time."}
-
+            
     async def search_knowledge_base(self, question: str, tenant_id: str, language: str) -> List[Dict[str, Any]]:
         """
         Search Elasticsearch for relevant documents using vector search
@@ -442,42 +497,35 @@ Generate a professional acknowledgment response thanking {sender_name} for their
             
             
             # Step 3: Perform vector search
-            search_results = await self.vector_search(
+            search_results = await self.search_elasticsearch_with_enhanced_chunking(
                 embedding=embeddings,  # Get the first embedding
                 tenant_id=tenant_id,
                 top_k=3,  # Get top 3 results as in original function
                 threshold=0.55,  # Cosine similarity threshold
-                metadata_filters=metadata_filters
+                metadata_filters=metadata_filters,include_context= True
             )
-            
+        
             return search_results
         except Exception as e:
             logger.error(f"Error searching knowledge base with vector search: {str(e)}", exc_info=True)
             return []
 
-    async def vector_search(
-        self,
-        embedding: List[float],
-        tenant_id: str,
-        top_k: int = 3,
-        threshold: float = 0.7,
-        metadata_filters: Optional[Dict[str, Any]] = None
+
+    async def search_elasticsearch_with_enhanced_chunking(
+        self, 
+        embedding: List[float], 
+        tenant_id: str, 
+        top_k: int = 5, 
+        threshold: float = 0.55,
+        metadata_filters: Optional[Dict[str, Any]] = None,
+        include_context: bool = True,
+        original_query: Optional[str] = None
     ) -> List[Dict[str, Any]]:
         """
-        Perform vector search in Elasticsearch
-        
-        Args:
-            embedding (List[float]): The question embedding vector
-            tenant_id (str): The tenant ID (compulsory field)
-            top_k (int): Number of top results to return
-            threshold (float): Similarity threshold for filtering results
-            metadata_filters (Dict[str, Any], optional): Additional filters for metadata
-            
-        Returns:
-            List[Dict[str, Any]]: List of search results
+        Enhanced search that works with improved chunking but keeps interface simple
         """
         try:
-            # Build the filter conditions - tenant_id is required
+            # Build basic filter conditions
             filter_conditions = [{"term": {"tenantId": tenant_id}}]
             
             # Add metadata filters if provided
@@ -488,23 +536,70 @@ Generate a professional acknowledgment response thanking {sender_name} for their
                     else:
                         filter_conditions.append({"term": {f"metadata.{key}": value}})
             
-            # Build the query with cosine similarity script scoring
-            query = {
-                "query": {
-                    "script_score": {
-                        "query": {
-                            "bool": {
-                                "filter": filter_conditions
-                            }
-                        },
-                        "script": {
-                            "source": "cosineSimilarity(params.query_vector, 'contentVector')",
-                            "params": {"query_vector": embedding}
+            # Build query - hybrid if we have original text, semantic-only otherwise
+            if original_query:
+                # Hybrid search: semantic + keyword (simple version)
+                query = {
+                    "query": {
+                        "bool": {
+                            "filter": filter_conditions,
+                            "should": [
+                                # Semantic search with normalized scoring
+                                {
+                                    "script_score": {
+                                        "query": {"match_all": {}},
+                                        "script": {
+                                            "source": "Math.max(0, (cosineSimilarity(params.query_vector, 'contentVector') + 1.0) / 2.0)",
+                                            "params": {"query_vector": embedding}
+                                        },
+                                        "boost": 2.0
+                                    }
+                                },
+                                # Simple keyword search
+                                {
+                                    "multi_match": {
+                                        "query": original_query,
+                                        "fields": ["content^2", "keywords^1.5", "sectionTitle"],
+                                        "type": "best_fields",
+                                        "boost": 1.0
+                                    }
+                                },
+                                # Boost FAQ content for question-like queries
+                                {
+                                    "bool": {
+                                        "must": [
+                                            {"wildcard": {"chunkType": "*faq*"}},
+                                            {"match": {"content": original_query}}
+                                        ],
+                                        "boost": 1.5 if self._is_question(original_query) else 1.0
+                                    }
+                                }
+                            ],
+                            "minimum_should_match": 1
                         }
-                    }
+                    },
+                    "_source": ["content", "documentId", "chunkPosition", "totalChunks", "chunkType"]
                 }
-            }
-   
+            else:
+                # Semantic-only search
+                query = {
+                    "query": {
+                        "script_score": {
+                            "query": {
+                                "bool": {
+                                    "filter": filter_conditions
+                                }
+                            },
+                            "script": {
+                                "source": "Math.max(0, (cosineSimilarity(params.query_vector, 'contentVector') + 1.0) / 2.0)",
+                                "params": {"query_vector": embedding}
+                            }
+                        }
+                    },
+                    "_source": ["content", "documentId", "chunkPosition", "totalChunks", "chunkType"]
+                }
+
+            logger.info(f"Enhanced search with original_query: {bool(original_query)}")
             
             # Execute search
             response = await self.es_client.search(
@@ -512,46 +607,163 @@ Generate a professional acknowledgment response thanking {sender_name} for their
                 body=query,
                 size=top_k
             )
-
-
-            # Process results
-            results = []
-            for hit in response['hits']['hits']:
-                score = hit['_score']
-                if score >= threshold:
-                    results.append({
-                        "content": hit['_source']['content'],
-                        "url": hit['_source'].get('url', None)
-                    })
             
-            logger.info(f"Vector search returned {len(results)} results above threshold {threshold}")
-            return results
-        except Exception as e:
-            logger.error(f"Error in vector search: {str(e)}", exc_info=True)
-            return []
-              
+            # Process results - keep it simple
+            results = []
+            
+            if include_context:
+                # Get chunks with basic adjacent context (existing logic)
+                for hit in response['hits']['hits']:
+                    score = hit['_score']
+                    if score >= threshold:
+                        enhanced_content = await self._get_chunk_with_adjacent_context(
+                            hit['_source'], 
+                            tenant_id
+                        )
+                        content = enhanced_content.get('content') or ""
+                        content = content.replace("\n", " ").strip()
+                       
+                        results.append({
+                            "content": content,
+                            "url": hit['_source'].get('url', None)
+                        })
+            else:
+                # Simple content only
+                for hit in response['hits']['hits']:
+                    score = hit['_score']
+                    if score >= threshold:
+                        content = hit['_source'].get('content') or ""
+                        content = content.replace("\n", " ").strip()
 
-    async def generate_embeddings(self, query: str) -> List[List[float]]:
-        """Generate embeddings for a query using a thread pool"""
+                        results.append({
+                            "content": content,
+                            "url": hit['_source'].get('url', None)
+                        })
+            
+            return results
+            
+        except Exception as e:
+            logger.error(f"Error searching Elasticsearch: {str(e)}", exc_info=True)
+            raise
+
+    async def _get_chunk_with_adjacent_context(
+            self, 
+            chunk_source: Dict[str, Any], 
+            tenant_id: str
+        ) -> Dict[str, Any]:
+        """
+        Get chunk content with adjacent context - simplified version
+        """
+        try:
+            document_id = chunk_source.get('documentId')
+            current_position = chunk_source.get('chunkPosition', 0)
+            total_chunks = chunk_source.get('totalChunks', 1)
+            
+            base_content = {
+                'content': chunk_source['content'],
+            }
+            
+            # Only get adjacent context if we have multiple chunks and it's not already consolidated
+            chunk_type = chunk_source.get('chunkType', '')
+            if total_chunks > 1 and not chunk_type.endswith('_consolidated'):
+                # Get previous and next chunk for context
+                adjacent_positions = []
+                if current_position > 0:
+                    adjacent_positions.append(current_position - 1)
+                if current_position < total_chunks - 1:
+                    adjacent_positions.append(current_position + 1)
+                
+                if adjacent_positions:
+                    adjacent_query = {
+                        "query": {
+                            "bool": {
+                                "must": [
+                                    {"term": {"tenantId": tenant_id}},
+                                    {"term": {"documentId": document_id}},
+                                    {"terms": {"chunkPosition": adjacent_positions}}
+                                ]
+                            }
+                        },
+                        "_source": ["content", "chunkPosition"],
+                        "sort": [{"chunkPosition": {"order": "asc"}}],
+                        "size": 2
+                    }
+                    
+                    try:
+                        adjacent_response = await self.es_client.search(
+                            index=ES_CONFIG['tenant_document_index_name'],
+                            body=adjacent_query
+                        )
+                        
+                        # Simple context addition
+                        context_parts = [base_content['content']]
+                        
+                        for hit in adjacent_response['hits']['hits']:
+                            pos = hit['_source']['chunkPosition']
+                            content = hit['_source']['content']
+                            
+                            if pos < current_position:
+                                context_parts.insert(0, content[-200:])  # Previous context
+                            elif pos > current_position:
+                                context_parts.append(content[:200])     # Next context
+                        
+                        # Combine with simple separators
+                        if len(context_parts) > 1:
+                            base_content['content'] = ' ... '.join(context_parts)
+                            
+                    except Exception as e:
+                        logger.warning(f"Could not fetch adjacent context: {str(e)}")
+            
+            return base_content
+            
+        except Exception as e:
+            logger.error(f"Error getting chunk with context: {str(e)}")
+            return {
+                'content': chunk_source.get('content', '')
+            }
+
+     
+
+    async def generate_embeddings(self, query: str) -> List[float]:
+        """Generate embeddings for a list of queries using a thread pool"""
         try:
             start_time = datetime.datetime.now()
             
             # Move the embedding generation to a separate thread 
             # since SentenceTransformer is not async-compatible
-            embeddings = await asyncio.to_thread(self._generate_embeddings_sync, query)
+            embeddings = await asyncio.to_thread(self._generate_embeddings_sync_optimized, query)
             
             end_time = datetime.datetime.now()
-            logger.info(f"Generated {len(query)} query embeddings in {(end_time - start_time).total_seconds()} seconds")
+            logger.info(f"Generated {len(query)} embeddings in {(end_time - start_time).total_seconds()} seconds")
             return embeddings
         except Exception as e:
-            logger.error(f"Error generating query embeddings: {str(e)}", exc_info=True)
+            logger.error(f"Error generating embeddings: {str(e)}", exc_info=True)
             raise
-    
-    def _generate_embeddings_sync(self, query: str) -> List[List[float]]:
-        """Synchronous method to generate embeddings (runs in a thread)"""
-        embeddings = self.embedding_model.encode(query)
-        return embeddings.tolist()
-    
+
+    def _generate_embeddings_sync_optimized(self, query: str) -> List[float]:
+        """Optimized synchronous embedding generation"""
+        try:
+            # Performance optimizations
+            with torch.no_grad():  # Disable gradient computation
+                embeddings = self.embedding_model.encode(
+                    query,
+                    show_progress_bar=False,  # Disable progress bar for single queries
+                    convert_to_numpy=True,    # Direct numpy conversion
+                    normalize_embeddings=True,  # Normalize for cosine similarity
+                    batch_size=1,            # Single query batch
+                    device=self.device       # Explicit device specification
+                )
+            
+            # Convert to list efficiently
+            if isinstance(embeddings, np.ndarray):
+                return embeddings.tolist()
+            else:
+                return embeddings
+                
+        except Exception as e:
+            logger.error(f"❌ Error in sync embedding generation: {str(e)}")
+            raise
+
 
 
 

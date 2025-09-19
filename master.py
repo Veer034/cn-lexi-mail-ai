@@ -523,6 +523,10 @@ class MultilingualMessageProcessor:
         # Extract text content from message
         content = message.get('emailBody') or ""
         subject = message.get('subject') or ""
+        # After cleaning (empty strings remain empty)
+        content = content.replace('\n', ' ').replace('\r', ' ')  # "" stays ""
+        subject = subject.replace('\n', ' ').replace('\r', ' ')  # "" stays ""
+        
         query_ai_mode = message.get('queryAIMode') or ""
         query_reply_template = message.get('queryReplyTemplate') or ""
         query_regards = message.get('queryRegards') or ""
@@ -546,6 +550,8 @@ class MultilingualMessageProcessor:
         else:
             complete_content = ''
 
+        complete_content = complete_content.replace('\n', ' ').replace('\r', ' ')
+
         if not complete_content:
             logger.warning(f"Email Message has no content, tenantId: {tenant_id}, threadId: {thread_id}")
             return
@@ -557,7 +563,6 @@ class MultilingualMessageProcessor:
             if not sender_name:
                 sender_name = self.extract_sender_name_multilingual(content, language)
 
-            complete_content = "Subject: " + subject + ", Body: " + content
             logging.info(f"language: {language} department: {department}, complete_content {complete_content}")
 
             # Perform classification
