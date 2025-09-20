@@ -29,7 +29,7 @@ class ComplaintProcessor:
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         
 
-    async def extract_complaints(self, tenant_id: str, email_content: str, language: str) -> Dict:
+    async def extract_complaints(self, tenant_id: str, email_content: str, language: str, language_code:str) -> Dict:
         """
         Extract complaints and related information from an email
         
@@ -62,7 +62,7 @@ class ComplaintProcessor:
                 query_results = await self.search_knowledge_base(
                     question=query,
                     tenant_id=tenant_id,
-                    language=language
+                    language_code=language_code
                     )
                 
                 logger.info(f"Query results: {query_results}")
@@ -271,104 +271,110 @@ Answer using document info only."""
             logger.error(f"Error processing advice response: {e}")
             return document_content
 
-   
+
     async def generate_complaint_response(self, sender_name: str, email_content: str, 
-                                    documents: List[Dict], language: str, 
-                                    template: str = None, 
-                                    complaint_regards: str = None) -> str:
+                                documents: List[Dict], language: str, 
+                                template: str = None, 
+                                complaint_regards: str = None) -> str:
         """Generate complaint response with template and custom regards support"""
         try:
+            # Base absolute rules
+            base_rules = f"""You are responding to a customer complaint in {language}. This is the ACTUAL REPLY email.
+
+    ABSOLUTE RULES - VIOLATION IS FORBIDDEN:
+    1. NEVER ask customer to contact support team or any other department - YOU ARE THE SUPPORT TEAM
+    2. NEVER generate phone numbers, email addresses, URLs, website links, business hours, or any other contact details
+    3. NEVER invent or infer information not explicitly present in the DOCUMENT CONTENT provided
+    4. If the DOCUMENT CONTENT does not contain solution for a complaint, respond with: "I understand your concern about this issue. Let me escalate this internally for resolution."
+    5. Show genuine empathy and take responsibility where appropriate
+    6. Provide specific solutions from documents when available
+    7. Use only first person ("I", "we", "our team")"""
+
+            # Closing instructions
+            template_closing = template if template else ''
+            default_closing = 'Best regards,\nCustomer Service Team' if not complaint_regards else ''
+            
+            if complaint_regards:
+                closing_instruction = "DO NOT add any closing/regards/signature — they will be added separately"
+            else:
+                closing_instruction = "End with a short, professional closing (e.g., 'Best regards, Customer Service Team')"
+
             # Build system prompt based on template and regards availability
             if template:
-                if complaint_regards:
-                    system_prompt = f"""You are a professional customer service AI assistant responding to complaints in {language}.
+                system_prompt = f"""{base_rules}
+    8. Follow this email template structure: {template_closing}
+    9. {closing_instruction}
 
-    Generate an empathetic complaint response following this template format:
-    {template}
+    Response format must be:
+    I sincerely apologize for the inconvenience you've experienced.
 
-    CRITICAL INSTRUCTIONS:
-    - Use the provided document information to address the complaint appropriately
-    - Maintain the template structure while incorporating relevant solutions
-    - Show empathy and understanding for the customer's concerns
-    - ABSOLUTELY DO NOT include any closing remarks, signatures, regards, or greetings at the end
-    - DO NOT add any closing phrases or farewell expressions in any language
-    - DO NOT add contact information, names, or signatures
-    - Stop immediately after delivering the main response content
-    - End your response with a period after the last sentence of actual content
+    Issues and Solutions:
+    1. [Issue]: [Solution from document OR "I understand your concern about this issue. Let me escalate this internally for resolution."]
+    2. [Issue]: [Solution from document OR "I understand your concern about this issue. Let me escalate this internally for resolution."]
 
-    Respond entirely in {language}."""
-                else:
-                    system_prompt = f"""You are a professional customer service AI assistant responding to complaints in {language}.
-
-    Generate an empathetic complaint response following this template format:
-    {template}
-
-    Use the provided document information to address the complaint appropriately.
-    Maintain the template structure while incorporating relevant solutions.
-    Show empathy and understanding for the customer's concerns.
-    Include appropriate professional closing.
-    Respond entirely in {language}."""
+    We appreciate your patience."""
             else:
-                if complaint_regards:
-                    system_prompt = f"""You are a professional customer service AI assistant responding to complaints in {language}.
+                system_prompt = f"""{base_rules}
+    8. {closing_instruction}
 
-    Generate an empathetic complaint response with:
-    1. Sincere apology and acknowledgment of {sender_name}'s concerns
-    2. Address the complaint using provided document information
-    3. Offer solutions or next steps based on available information
+    Response format must be:
+    Dear {sender_name},
 
-    CRITICAL INSTRUCTIONS:
-    - Show genuine empathy and take responsibility where appropriate
-    - ABSOLUTELY DO NOT include any closing remarks, signatures, regards, or greetings at the end
-    - DO NOT add any closing phrases or farewell expressions in any language
-    - DO NOT add contact information, names, or signatures
-    - Stop immediately after providing the solutions
-    - End your response with a period after the last sentence of actual content
+    I sincerely apologize for the inconvenience you've experienced.
 
-    Respond entirely in {language}."""
-                else:
-                    system_prompt = f"""You are a professional customer service AI assistant responding to complaints in {language}.
+    Issues and Solutions:
+    1. [Issue]: [Solution from document OR "I understand your concern about this issue. Let me escalate this internally for resolution."]
+    2. [Issue]: [Solution from document OR "I understand your concern about this issue. Let me escalate this internally for resolution."]
 
-    Generate an empathetic complaint response with:
-    1. Sincere apology and acknowledgment of {sender_name}'s concerns
-    2. Address the complaint using provided document information  
-    3. Offer solutions or next steps based on available information
-    4. Professional closing with commitment to resolve the issue
+    We are committed to resolving your concerns.
 
-    Show genuine empathy and take responsibility where appropriate.
-    Respond entirely in {language}."""
+    {default_closing}"""
 
             # Build user prompt with document content
-            user_prompt = f"""CUSTOMER COMPLAINT:
-    From: {sender_name}
-    Content: {email_content}
+            user_prompt = f"""CUSTOMER COMPLAINT FROM: {sender_name}
+    EMAIL CONTENT: {email_content}
 
-    AVAILABLE INFORMATION FOR RESOLUTION:
+    AVAILABLE RESOLUTION DOCUMENTS:
+    (Use ONLY the content provided below. DO NOT invent or infer solutions.)
     """
             
             if documents:
                 for i, doc in enumerate(documents[:3], 1):  # Limit to top 3 documents
-                    user_prompt += f"\nDocument {i}: {doc['content'][:500]}\n"
+                    user_prompt += f"\nDOCUMENT {i}: "
+                    if doc.get('content'):
+                        # Increased slice to 800 chars for better solution context
+                        doc_content = doc['content'][:800].strip()
+                        user_prompt += f'"{doc_content}"\n'
+                    else:
+                        user_prompt += "NO INFORMATION AVAILABLE\n"
                     if doc.get('url'):
                         user_prompt += f"Source: {doc['url']}\n"
+                    user_prompt += "---\n"
             else:
-                user_prompt += "No specific resolution information available in knowledge base.\n"
+                user_prompt += "NO RESOLUTION DOCUMENTS AVAILABLE\n"
 
-            user_prompt += f"\nGenerate empathetic complaint response in {language} addressing {sender_name}'s concerns."
-            
-            # Add additional instruction when custom regards are provided
-            if complaint_regards:
-                user_prompt += f"\nCRITICAL: Do not add any closing phrases or farewell expressions in {language} - stop after the main content."
+            user_prompt += f"""
+    CRITICAL INSTRUCTIONS:
+    - Write complete apology email reply in {language}
+    - Address each complaint issue using ONLY the document solutions provided above
+    - If documents show "NO INFORMATION AVAILABLE" or no relevant solution, respond with "I understand your concern about this issue. Let me escalate this internally for resolution."
+    - Show empathy and take responsibility
+    - NEVER ask customer to contact support - YOU ARE THE SUPPORT
+    - NEVER create phone numbers, emails, URLs, or any contact details
+    - Format as numbered complaint issues and solutions
+    - Be professional and solution-focused within strict document constraints"""
 
             # Check token usage
             estimated_tokens = self.estimate_tokens(system_prompt + user_prompt)
             if estimated_tokens > 7000:
                 user_prompt = user_prompt[:4000] + "..."
-            
+
             # Create API payload
             data = self.create_mistral_payload(system_prompt, user_prompt, max_tokens=800)
             data["model"] = MISTRAL_CONFIG['model']
-            data["temperature"] = 0.0  # Set to 0 for consistent responses
+            data["temperature"] = 0.0
+            data["top_p"] = 0.1
+            data["repetition_penalty"] = 1.1
             
             # Call API
             async with httpx.AsyncClient() as client:
@@ -381,20 +387,23 @@ Answer using document info only."""
             
             if response.status_code != 200:
                 logger.error(f"Mistral API error: {response.status_code} - {response.text}")
-                return "We sincerely apologize for the inconvenience. We are looking into your concerns and will respond promptly."
+                return f"Dear {sender_name}, I sincerely apologize for the inconvenience you've experienced. We are looking into your concerns and will resolve them promptly."
             
             response_data = response.json()
-            content = response_data['message']['content']
+            content = response_data['message']['content'].strip()
             
-            # Add custom regards if provided (regardless of template usage)
+            # Add regards if needed (exact phrase matching)
             if complaint_regards:
-                content = content.strip() + f"\n\n{complaint_regards}"
+                content_lower = content.lower()
+                if complaint_regards.lower() not in content_lower:
+                    content = content.rstrip() + f"\n\n{complaint_regards}"
             
             return content
             
         except Exception as e:
             logger.error(f"Error generating complaint response: {str(e)}", exc_info=True)
-            return "We sincerely apologize for the inconvenience. We are looking into your concerns and will respond promptly."
+            return f"Dear {sender_name}, I sincerely apologize for the inconvenience you've experienced. We are looking into your concerns and will resolve them promptly."
+
 
     async def generate_ticket_data(self, sender_name: str, complaints: List[str], 
                              suggestions: List[Dict], language: str) -> Optional[TicketData]:
@@ -625,14 +634,14 @@ Answer using document info only."""
             return []
 
 
-    async def search_knowledge_base(self, question: str, tenant_id: str, language: str) -> List[Dict[str, Any]]:
+    async def search_knowledge_base(self, question: str, tenant_id: str, language_code: str) -> List[Dict[str, Any]]:
         """
         Search Elasticsearch for relevant documents using vector search
         
         Args:
             question (str): The question to search for
             tenant_id (str): The tenant ID (compulsory field)
-            language (str, optional): The language of the question for potential language-specific handling
+            language_code (str, optional): The language of the question for potential language-specific handling
             
         Returns:
             List[Dict[str, Any]]: List of relevant documents
@@ -646,8 +655,8 @@ Answer using document info only."""
             
             # Step 2: Prepare metadata filters if needed (e.g., language-specific filtering)
             metadata_filters = {}
-            if language and language != "unknown":
-                metadata_filters["language"] = language
+            if language_code and language_code != "unknown":
+                metadata_filters["language"] = language_code
             
             
             

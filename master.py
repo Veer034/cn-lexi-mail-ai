@@ -16,6 +16,7 @@ from confluent_kafka import Consumer, Producer, KafkaError, TopicPartition
 from confluent_kafka.admin import AdminClient, NewTopic
 from config import KAFKA_CONFIG, ES_CONFIG, MISTRAL_CONFIG
 from deberta import EmailClassifier  # Import the function
+from lang_utils import LangUtil
 from query import QueryProcessor
 from complaint import ComplaintProcessor
 from suggestion import SuggestionProcessor
@@ -138,12 +139,15 @@ class MultilingualMessageProcessor:
                 basic_auth=(ES_CONFIG['username'], ES_CONFIG['password']),
                 verify_certs=ES_CONFIG.get('verify_certs', True),
                 ssl_show_warn=ES_CONFIG.get('ssl_show_warn', True),
-                # ca_certs=ES_CONFIG.get('ca_certs'),  # Add this line
+                ca_certs=ES_CONFIG.get('ca_certs'),  # Add this line
                 retry_on_timeout=True,
                 max_retries=3
             )
             logger.info("✓ Elasticsearch client initialized successfully")
-                
+
+            self.MISTRAL_CONFIG = MISTRAL_CONFIG    
+
+
             # Initialize SentenceTransformer with multilingual model
             model_name = 'paraphrase-multilingual-mpnet-base-v2'
             # model_path = models_path or os.path.join(os.getcwd(), 'models', 'sentence_transformer')
@@ -292,100 +296,83 @@ class MultilingualMessageProcessor:
         except Exception as e:
             logger.error(f"Error processing email: {str(e)}", exc_info=True)
             return {"error": str(e)}
-    
+
+
     async def _classify_email(self, email_content: str, detected_language: str, department: Optional[str] = None):
         """
-        Classify email into type and subtype using Mistral
-        This function handles emails in multiple languages including Japanese, Chinese,
-        Spanish, French, Russian, Arabic, and others
+        Classify email into type and subtype using Mistral.
         """
         department_str = ""
         if department:
             department_data = next((item for item in self.categories if item["sector"] == department), None)
             if department_data:
-                department_str = f"For the {department} department with these types:\n{json.dumps(department_data['types'], indent=2)}\n\n"
-        
-       
-        system_prompt = """You are a multilingual email classification assistant. Classify the email by type and subtype.
-    You can handle emails in any language including English, Japanese, Chinese, Spanish, French, Russian, Arabic, and others.
-    Identify the main intent regardless of the language used."""
-        
-        user_prompt = f"""Email content: {email_content}
-        
-        Language detected: {detected_language}
-        
-        {department_str}Classify this email as one of these types: "complaint", "query", "suggestion", or "spam".
-        If a specific subtype applies, include it. Otherwise, set subtype to "".
-        
-        Understand the context and intent regardless of language.
-        For non-Latin script languages (Japanese, Chinese, Arabic, Russian, etc.), analyze the message structure and key phrases.
+                department_str = f"For the {department} department, these are the valid types and subtypes:\n{json.dumps(department_data['types'], indent=2)}\n\n"
 
-        Respond ONLY with a JSON object like:
-        {{
-        "type": "selected_type",
-        "subtype": "selected_subtype"
-        }}"""
-        
-        # Call Mistral API with increased max_tokens to allow for better multilingual processing
+        system_prompt = (
+            "You are a multilingual email classification assistant. "
+            "Classify the email into one of the following types: complaint, query, suggestion, spam. "
+            "If a subtype is relevant based on the industry, include it. Otherwise, set subtype to an empty string."
+        )
+
+        user_prompt = f"""
+Email content: {email_content}
+
+Language detected: {detected_language}
+
+{department_str}
+Classify this email strictly into the format:
+
+{{
+"type": "selected_type",
+"subtype": "selected_subtype"
+}}
+
+- `type` must be one of: "query", "complaint", "suggestion", "spam".
+- `subtype` must be one of the predefined subtypes for the department, or "" if not applicable.
+- Respond ONLY with a JSON object, nothing else.
+- Do not add explanations or extra text.
+"""
+
         data = {
-            "model": MISTRAL_CONFIG['model'],
+            "model": self.MISTRAL_CONFIG['model'],
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}
             ],
             "stream": False,
-            "max_tokens": 200,  # Increased to give model more room for processing non-Latin languages
-            "temperature": 0.2  # Lower temperature for more consistent classification results
+            "max_tokens": 250,
+            "temperature": 0.2
         }
-        
+
         async with httpx.AsyncClient() as client:
             response = await client.post(
-                MISTRAL_CONFIG['service_url'],
+                self.MISTRAL_CONFIG['service_url'],
                 headers={
                     "Content-Type": "application/json",
-                    "Accept-Charset": "UTF-8"  # Ensure proper character encoding for non-Latin scripts
+                    "Accept-Charset": "UTF-8"
                 },
                 json=data,
-                timeout=MISTRAL_CONFIG['timeout']
+                timeout=self.MISTRAL_CONFIG['timeout']
             )
-        
+
         if response.status_code != 200:
             logger.error(f"Mistral API error: {response.status_code} - {response.text}")
             return {"type": "error", "subtype": ""}
-        
-        response_data = response.json()
-    
-        
+
         try:
+            response_data = response.json()
             content = response_data['message']['content']
-            clasification = json.loads(content)
-            return clasification
-        except Exception as e:
-            logger.error(f"Error processing complaints: {e}")
-            return []
 
-
-    
-    async def generate_embeddings(self, query: str) -> List[List[float]]:
-        """Generate embeddings for a query using a thread pool"""
-        try:
-            start_time = datetime.datetime.now()
-            
-            # Move the embedding generation to a separate thread 
-            # since SentenceTransformer is not async-compatible
-            embeddings = await asyncio.to_thread(self._generate_embeddings_sync, query)
-            
-            end_time = datetime.datetime.now()
-            logger.info(f"Generated {len(query)} embeddings in {(end_time - start_time).total_seconds()} seconds")
-            return embeddings
+            # Ensure strict JSON parsing
+            classification = json.loads(content)
+            if classification.get("type") not in ["query", "complaint", "suggestion", "spam"]:
+                classification["type"] = "spam"
+            if "subtype" not in classification:
+                classification["subtype"] = ""
+            return classification
         except Exception as e:
-            logger.error(f"Error generating embeddings: {str(e)}", exc_info=True)
-            raise
-    
-    def _generate_embeddings_sync(self, query: str) -> List[List[float]]:
-        """Synchronous method to generate embeddings (runs in a thread)"""
-        embeddings = self.st_model.encode(query)
-        return embeddings.tolist()
+            logger.error(f"Error parsing Mistral response: {e}")
+            return {"type": "error", "subtype": ""}
 
 
 
@@ -558,15 +545,16 @@ class MultilingualMessageProcessor:
 
         # Step 1: Basic classification - this must succeed or we go to DLQ
         try:
-            language = detect_language(content)
+            language_code = detect_language(content)
             
             if not sender_name:
-                sender_name = self.extract_sender_name_multilingual(content, language)
-
+                sender_name = self.extract_sender_name_multilingual(content, language_code)
+                    
+            language = LangUtil._get_language_by_code(language_code)
             logging.info(f"language: {language} department: {department}, complete_content {complete_content}")
 
             # Perform classification
-            if language == 'en' and department:
+            if language_code == 'en' and department:
                 type, subtype = await self.email_classifier.process_emails(content, department)
             else:
                 type, subtype = await self.categorize_email_using_mistral(complete_content, language, department)
@@ -584,8 +572,8 @@ class MultilingualMessageProcessor:
             threadId=thread_id, 
             messageId=message_id, 
             senderName=sender_name,
-            type=type, 
-            subType=subtype
+            type='query', 
+            subType=''
         )
         
         # Step 3: Enhanced processing based on type - if this fails, we'll use basic classification
@@ -596,12 +584,12 @@ class MultilingualMessageProcessor:
             if type == "query":
                 enhanced_classification = await self._process_query_type(
                     tenant_id, thread_id, message_id, sender_name, type, subtype,
-                    complete_content, language, query_ai_mode, query_reply_template, query_regards
+                    complete_content, language, language_code, query_ai_mode, query_reply_template, query_regards
                 )
             elif type == "complaint":
                 enhanced_classification = await self._process_complaint_type(
                     tenant_id, thread_id, message_id, sender_name, type, subtype,
-                    complete_content, subject, content, language, complaint_ai_mode, 
+                    complete_content, subject, content, language,language_code, complaint_ai_mode, 
                     complaint_reply_template, auto_complaint_ticket_generation, complaint_regards
                 )
             elif type == "suggestion":
@@ -611,6 +599,7 @@ class MultilingualMessageProcessor:
                     suggestion_reply_template, suggestion_regards
                 )
             else:
+                logging.info(f"Unknown email classification type : {type}")
                 # For spam or other types, use basic classification
                 enhanced_classification = basic_classification
                 
@@ -636,7 +625,7 @@ class MultilingualMessageProcessor:
             raise  # Re-raise to trigger DLQ handling
 
     async def _process_query_type(self, tenant_id, thread_id, message_id, sender_name, type, subtype,
-                                 complete_content, language, query_ai_mode, query_reply_template, query_regards):
+                                 complete_content, language, language_code,query_ai_mode, query_reply_template, query_regards):
         """Process query type emails with enhanced data extraction"""
         
         # If query reply generation is not required
@@ -657,6 +646,7 @@ class MultilingualMessageProcessor:
             sender_name, 
             complete_content, 
             language, 
+            language_code,
             type, 
             subtype, 
             query_ai_mode, 
@@ -694,7 +684,7 @@ class MultilingualMessageProcessor:
             )
 
     async def _process_complaint_type(self, tenant_id, thread_id, message_id, sender_name, type, subtype,
-                                    complete_content, subject, content, language, complaint_ai_mode, 
+                                    complete_content, subject, content, language,language_code, complaint_ai_mode, 
                                     complaint_reply_template, auto_complaint_ticket_generation, complaint_regards):
         """Process complaint type emails with enhanced data extraction"""
         
@@ -710,7 +700,7 @@ class MultilingualMessageProcessor:
             )
         
         # Step 1: Extract complaints and get relevant documents
-        complaint_list = await self.complaint_processor.extract_complaints(tenant_id, complete_content, language)
+        complaint_list = await self.complaint_processor.extract_complaints(tenant_id, complete_content, language,language_code)
         logger.info(f"complaint_list: {complaint_list}")
         
         complaint_response_content = None

@@ -1,0 +1,76 @@
+from logger_config import get_logger
+logger = get_logger(__name__)
+
+class LangUtil:
+    
+    supported_languages = {
+        'en': {'name': 'English', 'native': 'English'},
+        'fr': {'name': 'French', 'native': 'Français'},
+        'es': {'name': 'Spanish', 'native': 'Español'},
+        'de': {'name': 'German', 'native': 'Deutsch'},
+        'it': {'name': 'Italian', 'native': 'Italiano'},
+        'pt': {'name': 'Portuguese', 'native': 'Português'},
+        'nl': {'name': 'Dutch', 'native': 'Nederlands'},
+        'sv': {'name': 'Swedish', 'native': 'Svenska'},
+        'no': {'name': 'Norwegian', 'native': 'Norsk'},
+        'da': {'name': 'Danish', 'native': 'Dansk'},
+        'fi': {'name': 'Finnish', 'native': 'Suomi'},
+        'pl': {'name': 'Polish', 'native': 'Polski'},
+        'ru': {'name': 'Russian', 'native': 'Русский'},
+        'uk': {'name': 'Ukrainian', 'native': 'Українська'},
+        'cs': {'name': 'Czech', 'native': 'Čeština'},
+        'sk': {'name': 'Slovak', 'native': 'Slovenčina'},
+        'sl': {'name': 'Slovenian', 'native': 'Slovenščina'},
+        'hr': {'name': 'Croatian', 'native': 'Hrvatski'},
+        'bs': {'name': 'Bosnian', 'native': 'Bosanski'},
+        'sr': {'name': 'Serbian (Cyrillic)', 'native': 'Српски'},
+        'ro': {'name': 'Romanian', 'native': 'Română'},
+        'bg': {'name': 'Bulgarian', 'native': 'Български'},
+        'mk': {'name': 'Macedonian', 'native': 'Македонски'},
+        'el': {'name': 'Greek', 'native': 'Ελληνικά'},
+        'tr': {'name': 'Turkish', 'native': 'Türkçe'},
+        'hu': {'name': 'Hungarian', 'native': 'Magyar'},
+        'lt': {'name': 'Lithuanian', 'native': 'Lietuvių'},
+        'ca': {'name': 'Catalan', 'native': 'Català'},
+        'gl': {'name': 'Galician', 'native': 'Galego'},
+        'af': {'name': 'Afrikaans', 'native': 'Afrikaans'},
+        'sq': {'name': 'Albanian', 'native': 'Shqip'},
+        'az': {'name': 'Azerbaijani', 'native': 'Azərbaycan'},
+        'kk': {'name': 'Kazakh', 'native': 'Қазақша'},
+        'he': {'name': 'Hebrew', 'native': 'עברית'},
+        'ar': {'name': 'Arabic', 'native': 'العربية'},
+        'fa': {'name': 'Persian', 'native': 'فارسی'},
+        'ur': {'name': 'Urdu', 'native': 'اردو'},
+        'hi': {'name': 'Hindi', 'native': 'हिन्दी'},
+        'bn': {'name': 'Bengali', 'native': 'বাংলা'},
+        'pa': {'name': 'Punjabi', 'native': 'ਪੰਜਾਬੀ'},
+        'gu': {'name': 'Gujarati', 'native': 'ગુજરાતી'},
+        'mr': {'name': 'Marathi', 'native': 'मराठी'},
+        'ne': {'name': 'Nepali', 'native': 'नेपाली'},
+        'si': {'name': 'Sinhala', 'native': 'සිංහල'},
+        'ta': {'name': 'Tamil', 'native': 'தமிழ்'},
+        'te': {'name': 'Telugu', 'native': 'తెలుగు'},
+        'ml': {'name': 'Malayalam', 'native': 'മലയാളം'},
+        'kn': {'name': 'Kannada', 'native': 'ಕನ್ನಡ'},
+        'th': {'name': 'Thai', 'native': 'ไทย'},
+        'zh': {'name': 'Chinese (Simplified)', 'native': '简体中文'},
+        'zh-tw': {'name': 'Chinese (Traditional)', 'native': '繁體中文'},
+        'ja': {'name': 'Japanese', 'native': '日本語'},
+        'ko': {'name': 'Korean', 'native': '한국어'},
+        'vi': {'name': 'Vietnamese', 'native': 'Tiếng Việt'},
+        'id': {'name': 'Indonesian', 'native': 'Bahasa Indonesia'},
+        'ms': {'name': 'Malay', 'native': 'Bahasa Melayu'},
+        'sw': {'name': 'Swahili', 'native': 'Kiswahili'},
+        'ha': {'name': 'Hausa', 'native': 'Hausa'},
+        'ig': {'name': 'Igbo', 'native': 'Igbo'},
+        'ak': {'name': 'Akan', 'native': 'Akan'},
+        'tw': {'name': 'Twi', 'native': 'Twi'},
+        'sd': {'name': 'Sindhi', 'native': 'سنڌي'},
+        'ps': {'name': 'Pashto', 'native': 'پښتو'}
+    }
+        
+
+    @staticmethod
+    def _get_language_by_code(language_code: str) -> str:
+        language_code = language_code.lower()
+        return LangUtil.supported_languages.get(language_code, {}).get("name", "English")

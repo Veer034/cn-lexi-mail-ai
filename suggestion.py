@@ -169,77 +169,66 @@ class SuggestionProcessor:
             return []
 
     async def generate_suggestion_response(self, sender_name: str, email_content: str, 
-                                        suggestions: List[str], language: str, 
-                                        template: str = None, 
-                                        suggestion_regards: str = None) -> str:
+                                    suggestions: List[str], language: str, 
+                                    template: str = None, 
+                                    suggestion_regards: str = None) -> str:
         """Generate acknowledgment response for suggestions with template and custom regards support"""
         try:
+            # Base absolute rules
+            base_rules = f"""You are responding to a customer email in {language}. This is the ACTUAL REPLY email.
+
+    ABSOLUTE RULES - VIOLATION IS FORBIDDEN:
+    1. ONLY acknowledge what the customer suggested - do not promise any implementations, reviews, or future actions
+    2. Do not make commitments about what the company will do with the suggestions
+    3. NEVER invent or add information not provided in the customer's suggestions
+    4. Be polite, professional, and appreciative
+    5. Use only first person ("I", "we", "our team")"""
+
+            # Closing instructions
+            template_closing = template if template else ''
+            default_closing = 'Best regards,\nCustomer Service Team' if not suggestion_regards else ''
+            
+            if suggestion_regards:
+                closing_instruction = "DO NOT add any closing/regards/signature — they will be added separately"
+            else:
+                closing_instruction = "End with a short, professional closing (e.g., 'Best regards, Customer Service Team')"
+
             # Build system prompt based on template and regards availability
             if template:
-                if suggestion_regards:
-                    system_prompt = f"""You are a customer service assistant responding to suggestions in {language}.
+                system_prompt = f"""{base_rules}
+    6. Follow this email template structure: {template_closing}
+    7. {closing_instruction}
 
-    Follow this template:
-    {template}
+    Response format must be:
+    Thank you for contacting us.
 
-    Rules:
-    - Use the provided suggestions to fill content appropriately
-    - Show appreciation for customer feedback and suggestions
-    - Maintain template structure while expressing gratitude
-    - NEVER add closing text, regards, signatures, or names like [Your Name]
-    - Stop immediately after main content
+    Your suggestions:
+    - [Acknowledge specific suggestion]
+    - [Acknowledge specific suggestion]
 
-    Respond in {language}."""
-                else:
-                    system_prompt = f"""You are a customer service assistant responding to suggestions in {language}.
-
-    Follow this template:
-    {template}
-
-    Rules:
-    - Use the provided suggestions to fill content appropriately
-    - Show appreciation for customer feedback and suggestions
-    - Maintain template structure while expressing gratitude
-
-    Respond in {language}."""
+    We appreciate your feedback."""
             else:
-                if suggestion_regards:
-                    system_prompt = f"""You are a customer service assistant responding to suggestions in {language}.
+                system_prompt = f"""{base_rules}
+    6. {closing_instruction}
 
-    Write a professional acknowledgment response:
-    1. Thank {sender_name} for taking time to provide suggestions
-    2. Acknowledge the specific suggestions they made
-    3. Assure them the company will review and consider their suggestions
-    4. Express appreciation for their continued engagement
+    Response format must be:
+    Dear {sender_name},
 
-    Rules:
-    - Be polite, professional, and appreciative
-    - Do not promise specific implementations or timelines
-    - NEVER add closing text, regards, signatures, or names like [Your Name]
-    - Stop immediately after expressing appreciation
+    Thank you for taking the time to provide your suggestions.
 
-    Respond in {language}."""
-                else:
-                    system_prompt = f"""You are a customer service assistant responding to suggestions in {language}.
+    Your suggestions:
+    - [Acknowledge specific suggestion]
+    - [Acknowledge specific suggestion]
 
-    Write a professional acknowledgment response:
-    1. Thank {sender_name} for taking time to provide suggestions
-    2. Acknowledge the specific suggestions they made
-    3. Assure them the company will review and consider their suggestions
-    4. Express appreciation for their continued engagement
-    5. End with offer for further assistance
+    We appreciate your input.
 
-    Rules:
-    - Be polite, professional, and appreciative
-    - Do not promise specific implementations or timelines
-
-    Respond in {language}."""
+    {default_closing}"""
 
             # Build user prompt with suggestions
-            user_prompt = f"""Customer: {sender_name}
-    Message: {email_content}
+            user_prompt = f"""CUSTOMER EMAIL FROM: {sender_name}
+    EMAIL CONTENT: {email_content}
 
-    Suggestions provided:
+    SUGGESTIONS PROVIDED:
     """
             
             if suggestions:
@@ -248,16 +237,15 @@ class SuggestionProcessor:
             else:
                 user_prompt += "No specific suggestions identified.\n"
 
-            user_prompt += f"\nRespond in {language} thanking {sender_name} for their suggestions."
-            
-            if suggestion_regards:
-                user_prompt += " Do not add any closing text."
+            user_prompt += f"""
 
-            # Check token usage
-            estimated_tokens = self.estimate_tokens(system_prompt + user_prompt)
-            if estimated_tokens > 7000:
-                user_prompt = user_prompt[:4000] + "..."
-            
+    CRITICAL INSTRUCTIONS:
+    - Write complete email reply in {language}
+    - Acknowledge each suggestion provided above
+    - Show appreciation for their feedback
+    - NEVER promise implementations, reviews, or future actions
+    - Be professional and grateful within strict acknowledgment constraints"""
+
             # Create API payload
             data = self.create_mistral_payload(system_prompt, user_prompt, max_tokens=600)
             data["model"] = MISTRAL_CONFIG['model']
@@ -274,74 +262,23 @@ class SuggestionProcessor:
             
             if response.status_code != 200:
                 logger.error(f"Mistral API error: {response.status_code} - {response.text}")
-                return f"Thank you for your suggestions, {sender_name}. We will review them carefully and appreciate your feedback."
+                return f"Thank you for your suggestions, {sender_name}. We appreciate your feedback."
             
             response_data = response.json()
             content = response_data['message']['content'].strip()
             
-            # Remove closing text if custom regards will be added
+            # Add regards if needed (exact phrase matching)
             if suggestion_regards:
-                content = re.sub(r'\n\n?(best regards|regards|sincerely|\[.*\]).*$', '', content, flags=re.IGNORECASE | re.MULTILINE).strip()
-                content = content + f"\n\n{suggestion_regards}"
+                content_lower = content.lower()
+                if suggestion_regards.lower() not in content_lower:
+                    content = content.rstrip() + f"\n\n{suggestion_regards}"
             
             return content
             
         except Exception as e:
             logger.error(f"Error generating suggestion response: {str(e)}", exc_info=True)
-            return f"Thank you for your suggestions, {sender_name}. We will review them carefully and appreciate your feedback."
-
-    def _create_suggestion_system_prompt(self, language: str, suggestion_ai_mode: str = None, template: str = None) -> str:
-        """Create system prompt for suggestion acknowledgment responses"""
-        
-        base_prompt = f"""You are a professional customer service AI assistant responding to customer suggestions in {language}.
-
-    RESPONSE GUIDELINES:
-    1. Be polite, professional, and appreciative
-    2. Acknowledge the specific suggestions made by the customer
-    3. Thank them for taking the time to provide feedback
-    4. Assure them that the company will review and consider their suggestions
-    5. Keep the tone warm but professional
-    6. Do NOT promise specific implementations or timelines
-    7. Do NOT provide solutions - only acknowledge receipt and review
-    8. Respond in {language} language
-
-    RESPONSE STRUCTURE:
-    - Thank the customer for their suggestions
-    - Acknowledge the specific suggestions they made
-    - Assure them the company will look into the suggestions
-    - Express appreciation for their continued engagement
-    - Professional closing
-
-    Keep the response concise but thoughtful."""
-
-        if suggestion_ai_mode:
-            base_prompt += f"\n\nADDITIONAL MODE: {suggestion_ai_mode}"
-        
-        if template:
-            base_prompt += f"\n\nTEMPLATE GUIDANCE: {template}"
-        
-        return base_prompt
-
-    def _create_suggestion_user_prompt(self, sender_name: str, email_content: str, 
-                                    suggestions_context: str, template: str = None, 
-                                    suggestion_ai_mode: str = None) -> str:
-        """Create user prompt for suggestion acknowledgment"""
-        
-        prompt = f"""CUSTOMER EMAIL:
-    From: {sender_name}
-    Content: {email_content}
-
-    {suggestions_context}
-
-    Generate a professional acknowledgment response that:
-    1. Thanks {sender_name} for their valuable suggestions
-    2. Acknowledges that the company will review and consider the suggestions
-    3. Expresses appreciation for their feedback
-    4. Maintains a professional and courteous tone
-
-    The response should be a direct email reply, not a JSON format."""
-
-        return prompt
+            return f"Thank you for your suggestions, {sender_name}. We appreciate your feedback."
+    
 
     def _get_fallback_suggestion_response(self, sender_name: str, language: str) -> str:
         """Generate simple fallback response for suggestions"""

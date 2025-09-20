@@ -8,7 +8,8 @@ import asyncio
 from typing import List, Dict, Any, Optional, Set
 from config import  ES_CONFIG, MISTRAL_CONFIG
 from pydantic import BaseModel, Field
-
+import traceback
+from lang_utils import LangUtil 
 # Configure logging
 from logger_config import get_logger
 logger = get_logger(__name__)
@@ -28,7 +29,7 @@ class QueryProcessor:
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         
 
-    async def extract_query_generate_responses(self, tenant_id: str, thread_id:str, sender_name:str, email_content: str, language: str, type: str, subtype: Optional[str] = None, query_ai_mode: str = None, template: str = None, query_regards: str= None) -> Dict[str,Any]:
+    async def extract_query_generate_responses(self, tenant_id: str, thread_id:str, sender_name:str, email_content: str, language: str, language_code: str,type: str, subtype: Optional[str] = None, query_ai_mode: str = None, template: str = None, query_regards: str= None) -> Dict[str,Any]:
         
          # Extract all questions from the email
         questions_batch = await self.extract_multiple_questions(email_content,language,type,subtype)
@@ -39,7 +40,7 @@ class QueryProcessor:
             return await self.generate_no_questions_response(sender_name, email_content, language, query_ai_mode, template)
         
 
-        query_response = await self.batch_generate_responses(sender_name,email_content,questions_batch,tenant_id,language,query_ai_mode,template,query_regards)
+        query_response = await self.batch_generate_responses(sender_name,email_content,questions_batch,tenant_id,language,language_code,query_ai_mode,template,query_regards)
         
         # query_response is already a dictionary, no need to parse JSON
         return query_response
@@ -110,140 +111,147 @@ class QueryProcessor:
         Returns:
             List[str]: A list of extracted questions
         """
-        system_prompt = """You are a multilingual email analysis assistant specialized in identifying questions with precision and consistency across all languages.
+        system_prompt = f"""Extract questions from emails in {language}. Return only a JSON array format.
 
-    Your task is to find and extract questions from emails - including direct questions, information requests, and polite inquiries that seek specific information or action.
+    Extract:
+    - Direct questions (What plans are available?)
+    - Information requests (Can you provide contact details?)
+    - Requests that need specific answers
 
-    WHAT TO EXTRACT:
-    1. Direct questions using interrogative words in any language
-    2. Sentences with question punctuation (varies by language)
-    3. Polite requests that ask for specific information or action
-    4. Information-seeking statements that clearly request answers
+    Do NOT extract:
+    - General statements (I need help, I am looking for)
+    - Greetings or thanks
 
-    WHAT NOT TO EXTRACT:
-    1. General statements of need or desire that don't ask questions
-    2. Statements of preference that don't seek information
-    3. Greetings, thanks, or social pleasantries
-    4. Confirmations or acknowledgments
+    Return format: ["question 1", "question 2"] or [] if no questions found."""
 
-    IMPORTANT: Analyze BOTH the subject line AND the email body - questions can appear in either location.
-
-    Work with any language and writing system. Be consistent across all languages."""
-        
         context_description = f"{type}" + (f", subtype: {subtype}" if subtype else "")
         
-        user_prompt = f"""
-    EMAIL TO ANALYZE:
-    Subject: {email_content.split('Body:')[0].replace('Subject:', '').strip() if 'Subject:' in email_content else 'No subject'}
-    Body: {email_content.split('Body:')[1].strip() if 'Body:' in email_content else email_content}
+        user_prompt = f"""Email Type: {context_description}
+    Language: {language}
 
-    TASK:
-    Analyze BOTH the subject line AND body of this {context_description} email in {language} language.
+    Email Content:
+    {email_content}
 
-    Extract questions that ask for information, action, or clarification from BOTH subject and body:
-    - Direct questions (What plans are available?)
-    - Information requests (Please provide contact details)
-    - Polite inquiries seeking specific answers
+    Extract all questions that request specific information or action. Return only JSON array format."""
 
-    DO NOT extract general statements like "I need..." or "I am looking for..." unless they're phrased as actual questions.
-
-    Return a clean JSON array:
-    ["question from subject or body", "another question"]
-
-    If no questions found, return: []"""
-        
-        # Call Mistral API
-        data = {
-            "model": MISTRAL_CONFIG['model'],
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
-            ],
-            "stream": False,
-            "max_tokens": 400,  # Reduced to encourage conciseness
-            "temperature": 0.05  # Even lower for maximum consistency
-        }
-        
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                MISTRAL_CONFIG['service_url'],
-                headers={"Content-Type": "application/json"},
-                json=data,
-                timeout=MISTRAL_CONFIG['timeout']
-            )
-        
-        if response.status_code != 200:
-            logger.error(f"Mistral API error: {response.status_code} - {response.text}")
-            return []
-        
-        response_data = response.json()
-        logger.info(f"response_data: {response_data}")
-        
         try:
-            content = response_data['message']['content']
-            logger.info(f"Raw content: {content}")
+            # Call Mistral API with simpler parameters
+            data = {
+                "model": MISTRAL_CONFIG['model'],
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                "stream": False,
+                "max_tokens": 300,
+                "temperature": 0.1
+            }
             
-            # Clean the content by removing markdown code blocks if present
-            cleaned_content = content.strip()
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    MISTRAL_CONFIG['service_url'],
+                    headers={"Content-Type": "application/json"},
+                    json=data,
+                    timeout=60
+                )
             
-            # Remove ```json and ``` if present
-            if cleaned_content.startswith('```json'):
-                cleaned_content = cleaned_content[7:]  # Remove ```json
-            elif cleaned_content.startswith('```'):
-                cleaned_content = cleaned_content[3:]   # Remove ```
-                
-            if cleaned_content.endswith('```'):
-                cleaned_content = cleaned_content[:-3]  # Remove trailing ```
-                
-            # Remove any remaining whitespace/newlines
-            cleaned_content = cleaned_content.strip()
-            
-            logger.info(f"Cleaned content: {cleaned_content}")
-            
-            # Parse the JSON
-            questions = json.loads(cleaned_content)
-            
-            # Validate that questions is a list
-            if not isinstance(questions, list):
-                logger.error(f"Expected list but got {type(questions)}: {questions}")
+            if response.status_code != 200:
+                logger.error(f"Mistral API error: {response.status_code} - {response.text}")
                 return []
             
-            # Additional validation - limit to reasonable number of questions
-            if len(questions) > 10:  # Sanity check
-                logger.warning(f"Unusually high number of questions extracted: {len(questions)}, truncating to first 5")
-                questions = questions[:5]
+            response_data = response.json()
+            content = response_data['message']['content']
+            logger.info(f"Raw API response: {repr(content)}")
+            
+            # Aggressive cleaning for JSON extraction
+            cleaned_content = content.strip()
+            
+            # Remove common prefixes/suffixes that break JSON
+            prefixes_to_remove = ['```json', '```', 'json', 'JSON:', 'Questions:', 'Array:']
+            suffixes_to_remove = ['```', '```json']
+            
+            for prefix in prefixes_to_remove:
+                if cleaned_content.startswith(prefix):
+                    cleaned_content = cleaned_content[len(prefix):].strip()
+            
+            for suffix in suffixes_to_remove:
+                if cleaned_content.endswith(suffix):
+                    cleaned_content = cleaned_content[:-len(suffix)].strip()
+            
+            logger.info(f"Cleaned content: {repr(cleaned_content)}")
+            
+            # Multiple parsing attempts
+            parsing_attempts = [
+                # Attempt 1: Direct parsing
+                lambda: json.loads(cleaned_content),
                 
-            logger.info(f"Extracted questions: {questions}")
-            return questions
+                # Attempt 2: Extract JSON array with regex
+                lambda: json.loads(re.search(r'\[.*?\]', cleaned_content, re.DOTALL).group(0)),
+                
+                # Attempt 3: Fix common JSON issues and parse
+                lambda: json.loads(cleaned_content.replace("'", '"').replace('`', '')),
+                
+                # Attempt 4: Extract and fix quotes
+                lambda: json.loads(re.sub(r'["""]', '"', cleaned_content)),
+            ]
             
-        except json.JSONDecodeError as e:
-            logger.error(f"JSON decode error: {e}")
-            logger.error(f"Content that failed to parse: {repr(content)}")
+            questions = []
+            for i, attempt in enumerate(parsing_attempts, 1):
+                try:
+                    result = attempt()
+                    if isinstance(result, list):
+                        questions = result
+                        logger.info(f"Parsing attempt {i} successful: {questions}")
+                        break
+                    else:
+                        logger.warning(f"Attempt {i} returned non-list: {type(result)}")
+                except Exception as e:
+                    logger.debug(f"Parsing attempt {i} failed: {e}")
+                    continue
             
-            # Fallback: Try to extract JSON using regex
-            try:
-                # Look for JSON array pattern in the content
-                json_match = re.search(r'\[.*?\]', content, re.DOTALL)
-                if json_match:
-                    json_str = json_match.group(0)
-                    questions = json.loads(json_str)
-                    if isinstance(questions, list):
-                        # Apply same validation
-                        if len(questions) > 10:
-                            questions = questions[:5]
-                        logger.info(f"Extracted questions via regex: {questions}")
-                        return questions
-            except Exception as fallback_error:
-                logger.error(f"Fallback regex extraction failed: {fallback_error}")
+            # If all parsing attempts failed, try manual extraction
+            if not questions:
+                logger.warning("All JSON parsing attempts failed, trying manual extraction")
+                
+                # Look for quoted strings that could be questions
+                question_pattern = r'"([^"]*\?[^"]*)"'
+                matches = re.findall(question_pattern, cleaned_content)
+                if matches:
+                    questions = matches
+                    logger.info(f"Manual extraction found: {questions}")
+                else:
+                    # Look for any quoted strings as potential questions
+                    general_pattern = r'"([^"]+)"'
+                    matches = re.findall(general_pattern, cleaned_content)
+                    # Filter for question-like content
+                    questions = [q for q in matches if any(word in q.lower() for word in ['what', 'how', 'when', 'where', 'why', 'can', 'could', 'will', 'would', 'do', 'does', 'is', 'are']) or q.strip().endswith('?')]
+                    logger.info(f"General extraction found: {questions}")
             
-            return []
+            # Validation and cleanup
+            if not isinstance(questions, list):
+                logger.error(f"Final result is not a list: {type(questions)}")
+                return []
+            
+            # Clean up questions and validate
+            cleaned_questions = []
+            for q in questions:
+                if isinstance(q, str) and len(q.strip()) > 3:
+                    cleaned_questions.append(q.strip())
+            
+            # Limit number of questions
+            if len(cleaned_questions) > 5:
+                logger.warning(f"Too many questions ({len(cleaned_questions)}), limiting to 5")
+                cleaned_questions = cleaned_questions[:5]
+            
+            logger.info(f"Final extracted questions: {cleaned_questions}")
+            return cleaned_questions
             
         except Exception as e:
-            logger.error(f"Error processing questions: {e}")
-            logger.error(f"Content: {repr(content)}")
+            logger.error(f"Critical error in question extraction: {str(e)}")
+            logger.error(f"Traceback: {traceback.format_exc()}")
             return []
 
-    async def batch_generate_responses(self, sender_name: str, email_content:str, questions_batch: List[str], tenant_id: str, language: str, query_ai_mode: str = None,template: str = None,query_regards: str= None) -> Dict[str, Any]:
+    async def batch_generate_responses(self, sender_name: str, email_content:str, questions_batch: List[str], tenant_id: str, language: str, language_code: str, query_ai_mode: str = None,template: str = None,query_regards: str= None) -> Dict[str, Any]:
         """
         Process multiple questions in batches to minimize API calls
         
@@ -264,7 +272,7 @@ class QueryProcessor:
             search_results = await self.search_knowledge_base(
                 question=question,
                 tenant_id=tenant_id,
-                language=language
+                language_code=language_code
             )
             question_documents[question] = search_results
 
@@ -336,148 +344,156 @@ class QueryProcessor:
         return await self.generate_query_response(sender_name, email_content, question_documents, language,template,query_regards)
 
     async def generate_query_response(self, sender_name: str, email_content: str, 
-                    question_documents: Dict[str, List[Dict]], 
-                    language: str, template: str = None, query_regards: str = None) -> Dict[str, Any]:
-        """Generate structured query response with document-based answers"""
+                question_documents: Dict[str, List[Dict]], 
+                language: str, template: str = None, query_regards: str = None) -> Dict[str, Any]:
+        """Generate structured query response with document-based answers"""        
+        
         try:
-            # Build system prompt based on template and regards availability
-            if template:
-                if query_regards:
-                    system_prompt = f"""You are a customer service representative responding in {language}.
-
-    Follow this template:
-    {template}
-
-    Rules:
-    - Write as a helpful customer service agent speaking directly to the customer
-    - Use information from provided documents when available
-    - When information is not available, politely explain that you don't have that specific information at hand
-    - Speak in first person ("I", "we", "our company") rather than third person
-    - Be conversational and professional, not robotic
-    - DO NOT add any closing text, signatures, regards, or contact information
-    - DO NOT add any closing phrases or greetings at the end
-    - Stop immediately after answering the last question
-
-    Respond in {language}."""
-                else:
-                    system_prompt = f"""You are a customer service representative responding in {language}.
-
-    Follow this template:
-    {template}
-
-    Rules:
-    - Write as a helpful customer service agent speaking directly to the customer
-    - Use information from provided documents when available
-    - When information is not available, politely explain that you don't have that specific information at hand
-    - Speak in first person ("I", "we", "our company") rather than third person
-    - Be conversational and professional, not robotic
-    - End with appropriate professional closing
-
-    Respond in {language}."""
-            else:
-                if query_regards:
-                    system_prompt = f"""You are a customer service representative responding in {language}.
-
-    Write a response that:
-    1. Thanks {sender_name} for reaching out
-    2. Answers their questions using available information
-    3. For missing information, politely explains you don't have those details readily available
-    4. Speaks naturally in first person as a real person would
-
-    Style guidelines:
-    - Write as "I" or "we" (our team/company), not "the documentation says"
-    - Be warm, helpful, and conversational
-    - When you don't know something, say "I don't have that information available right now" instead of referring to documentation
-    - DO NOT add any closing text, signatures, regards, or contact information
-    - DO NOT add any closing phrases or greetings at the end
-    - Stop immediately after the last answer
-
-    Respond in {language}."""
-                else:
-                    system_prompt = f"""You are a customer service representative responding in {language}.
-
-    Write a response that:
-    1. Thanks {sender_name} for reaching out
-    2. Answers their questions using available information  
-    3. For missing information, politely explains you don't have those details readily available
-    4. Offers to help further or connect them with someone who can assist
-    5. Speaks naturally in first person as a real person would
-
-    Style guidelines:
-    - Write as "I" or "we" (our team/company), not "the documentation says"
-    - Be warm, helpful, and conversational
-    - When you don't know something, say "I don't have that information available right now" instead of referring to documentation
-    - Sound like a real person helping another person
-    - End with appropriate professional closing
-
-    Respond in {language}."""
-
-            # Build user prompt with better context
-            user_prompt = f"""Customer: {sender_name}
-    Customer's message: {email_content}
-
-    Here are their questions with available information:
-    """
+            logger.info(f"Generating query response for {sender_name} in {language}")
             
-            for i, (question, docs) in enumerate(question_documents.items(), 1):
-                user_prompt += f"\nQuestion {i}: {question}\n"
-                if docs and docs[0].get('content'):
-                    user_prompt += f"Available information: {docs[0]['content'][:400]}\n"
-                    if docs[0].get('url'):
-                        user_prompt += f"Reference: {docs[0]['url']}\n"
-                else:
-                    user_prompt += "No specific information available for this question.\n"
+            # Base absolute rules
+            base_rules = f"""You are responding to a customer email in {language}. This is the ACTUAL REPLY email.
 
-            user_prompt += f"\nRespond naturally in {language} as a helpful customer service representative. Address each question conversationally, not in a formal Q&A format. When you don't have information, explain it naturally without mentioning 'documentation'."
-            
-            # Add instruction when custom regards are provided
+    ABSOLUTE RULES - VIOLATION IS FORBIDDEN:
+    1. NEVER generate phone numbers, email addresses, URLs, website links, business hours, or any other contact details under any circumstance.
+    2. NEVER invent or infer information not explicitly present in the DOCUMENT CONTENT provided.
+    3. If the DOCUMENT CONTENT does not explicitly contain an answer, always respond with EXACTLY: "I don't have that information available right now".
+    4. Format responses strictly as point-by-point Q&A structure.
+    5. Use only first person ("I", "we", "our team")."""
+
+            # Closing instructions
+            template_closing = template if template else ''
+            default_closing = 'Best regards,\nCustomer Service Team' if not query_regards else ''
+            # Closing instructions
             if query_regards:
-                user_prompt += f"\n\nIMPORTANT: Do not add any closing text, regards, signatures, or closing phrases in {language}. Stop after answering all questions."
+                closing_instruction = "DO NOT add any closing/regards/signature — they will be added separately"
+            else:
+                closing_instruction = "End with a short, professional closing (e.g., 'Best regards, Customer Service Team')"
 
-            # Create API payload
-            data = self.create_mistral_payload(system_prompt, user_prompt, max_tokens=800)
-            data["model"] = MISTRAL_CONFIG['model']
-            data["temperature"] = 0.0  # Set to 0 for consistent responses
-            
-            logger.info(f"question request : {data}")
+            # Build system prompt
+            if template:
+                system_prompt = f"""{base_rules}
+    6. Follow this email template structure: {template_closing}
+    7. {closing_instruction}
+
+    Response format must be:
+    Thank you for contacting us.
+
+    1. [Question]: [Answer from document OR "I don't have that information available right now"]
+    2. [Question]: [Answer from document OR "I don't have that information available right now"]
+    """
+            else:
+                system_prompt = f"""{base_rules}
+    6. {closing_instruction}
+
+    Response format must be:
+    Dear {sender_name},
+
+    Thank you for reaching out to us.
+
+    1. [Question]: [Answer from document OR "I don't have that information available right now"]
+    2. [Question]: [Answer from document OR "I don't have that information available right now"]
+
+    {default_closing}"""
+
+            # Build user prompt
+            user_prompt = f"""CUSTOMER EMAIL FROM: {sender_name}
+    EMAIL CONTENT: {email_content}
+
+    QUESTIONS WITH AVAILABLE DOCUMENTS:
+    (Use ONLY the content provided below. DO NOT invent or infer information.)
+    """
+            # Append questions
+            for idx, (question, docs) in enumerate(question_documents.items(), start=1):
+                user_prompt += f"\nQUESTION {idx}: {question}\nDOCUMENT CONTENT: "
+                if docs and len(docs) > 0 and docs[0].get('content'):
+                    # Increased slice to 1000 chars
+                    doc_content = docs[0]['content'][:1000].strip()
+                    user_prompt += f'"{doc_content}"\n'
+                else:
+                    user_prompt += "NO INFORMATION AVAILABLE\n"
+                user_prompt += "---\n"
+
+            user_prompt += f"""
+    CRITICAL INSTRUCTIONS:
+    - Write complete email reply in {language}
+    - Answer each question using ONLY the document content provided above
+    - If document shows "NO INFORMATION AVAILABLE", respond with "I don't have that information available right now"
+    - NEVER create phone numbers, emails, URLs, or any contact details
+    - Format as numbered Q&A list
+    - Be professional and helpful within strict document constraints"""
+
+            # Build API payload
+            try:
+                data = self.create_mistral_payload(system_prompt, user_prompt, max_tokens=700)
+                data["model"] = MISTRAL_CONFIG['model']
+                data["temperature"] = 0.0
+                data["top_p"] = 0.1
+                data["repetition_penalty"] = 1.1
+                logger.info("API payload created successfully")
+            except Exception as payload_error:
+                logger.error(f"Payload creation failed: {str(payload_error)}")
+                return {"error": "Failed to create API request"}
 
             # Call API
-            async with httpx.AsyncClient() as client:
-                response = await client.post(
-                    MISTRAL_CONFIG['service_url'],
-                    headers={"Content-Type": "application/json"},
-                    json=data,
-                    timeout=MISTRAL_CONFIG['timeout']
-                )
-            
+            try:
+                logger.info(f"Calling Mistral API : {data}")
+                async with httpx.AsyncClient() as client:
+                    response = await client.post(
+                        MISTRAL_CONFIG['service_url'],
+                        headers={"Content-Type": "application/json"},
+                        json=data,
+                        timeout=MISTRAL_CONFIG['timeout']  # increased to handle larger content
+                    )
+                logger.info(f"API response status: {response.status_code}")
+            except httpx.TimeoutException:
+                logger.error("API request timeout")
+                return {"error": "Request timeout - please try again"}
+            except Exception as api_error:
+                logger.error(f"API call failed: {str(api_error)}")
+                return {"error": "API communication failed"}
+
+            # Parse response
             if response.status_code != 200:
-                logger.error(f"Mistral API error: {response.status_code}")
-                return {"error": "Sorry, I couldn't generate a response at this time."}
-            
-            response_data = response.json()
-            logger.info(f"query response : {response_data}")
-            
-            # Add custom regards if provided
+                logger.error(f"API error {response.status_code}: {response.text}")
+                return {"error": f"API returned error: {response.status_code}"}
+
+            try:
+                response_data = response.json()
+                content = response_data.get('message', {}).get('content')
+                if not content:
+                    logger.error("Empty response from API")
+                    return {"error": "Empty response received"}
+            except Exception as parse_error:
+                logger.error(f"Response parsing failed: {str(parse_error)}")
+                return {"error": "Failed to parse API response"}
+
+            # Add regards if needed (exact phrase matching)
             if query_regards:
-                logger.info(f"query_regards : {query_regards}")
-                content = response_data['message']['content'].strip()
-                content = content + f"\n\n{query_regards}"
-                response_data['message']['content'] = content
-            
+                content_lower = content.lower()
+                if query_regards.lower() not in content_lower:
+                    content = content.rstrip() + f"\n\n{query_regards}"
+                    response_data['message']['content'] = content
+                    logger.info("Custom regards added successfully")
+
+            logger.info("Query response generated successfully")
             return response_data
-            
+
         except Exception as e:
-            logger.error(f"Error generating query response: {str(e)}")
-            return {"error": "Sorry, I couldn't generate a response at this time."}
-            
-    async def search_knowledge_base(self, question: str, tenant_id: str, language: str) -> List[Dict[str, Any]]:
+            import traceback
+            logger.error(f"Critical error in query response: {str(e)}")
+            logger.error(traceback.format_exc())
+            return {"error": f"System error: {str(e)}"}
+
+
+    async def search_knowledge_base(self, question: str, tenant_id: str, language_code: str) -> List[Dict[str, Any]]:
         """
         Search Elasticsearch for relevant documents using vector search
         
         Args:
             question (str): The question to search for
             tenant_id (str): The tenant ID (compulsory field)
-            language (str, optional): The language of the question for potential language-specific handling
+            language_code (str, optional): The language of the question for potential language-specific handling
             
         Returns:
             List[Dict[str, Any]]: List of relevant documents
@@ -491,8 +507,8 @@ class QueryProcessor:
             
             # Step 2: Prepare metadata filters if needed (e.g., language-specific filtering)
             metadata_filters = {}
-            if language and language != "unknown":
-                metadata_filters["language"] = language
+            if language_code and language_code != "unknown":
+                metadata_filters["language"] = language_code
             
             
             
@@ -522,12 +538,12 @@ class QueryProcessor:
         original_query: Optional[str] = None
     ) -> List[Dict[str, Any]]:
         """
-        Enhanced search that works with improved chunking but keeps interface simple
+        Enhanced search that works with improved chunking but preserves contact information
         """
         try:
             # Build basic filter conditions
             filter_conditions = [{"term": {"tenantId": tenant_id}}]
-            
+            language_code = metadata_filters["language"]
             # Add metadata filters if provided
             if metadata_filters:
                 for key, value in metadata_filters.items():
@@ -571,14 +587,14 @@ class QueryProcessor:
                                             {"wildcard": {"chunkType": "*faq*"}},
                                             {"match": {"content": original_query}}
                                         ],
-                                        "boost": 1.5 if self._is_question(original_query) else 1.0
+                                        "boost": 1.5 if self._is_question(original_query,language_code) else 1.0
                                     }
                                 }
                             ],
                             "minimum_should_match": 1
                         }
                     },
-                    "_source": ["content", "documentId", "chunkPosition", "totalChunks", "chunkType"]
+                    "_source": ["content", "documentId", "chunkPosition", "totalChunks", "chunkType", "url"]
                 }
             else:
                 # Semantic-only search
@@ -596,7 +612,7 @@ class QueryProcessor:
                             }
                         }
                     },
-                    "_source": ["content", "documentId", "chunkPosition", "totalChunks", "chunkType"]
+                    "_source": ["content", "documentId", "chunkPosition", "totalChunks", "chunkType", "url"]
                 }
 
             logger.info(f"Enhanced search with original_query: {bool(original_query)}")
@@ -608,32 +624,34 @@ class QueryProcessor:
                 size=top_k
             )
             
-            # Process results - keep it simple
+            # Process results - preserve contact information
             results = []
             
             if include_context:
-                # Get chunks with basic adjacent context (existing logic)
+                # Get chunks with context but preserve contact info
                 for hit in response['hits']['hits']:
                     score = hit['_score']
                     if score >= threshold:
-                        enhanced_content = await self._get_chunk_with_adjacent_context(
+                        enhanced_content = await self._get_chunk_with_adjacent_context_preserve_contacts(
                             hit['_source'], 
                             tenant_id
                         )
                         content = enhanced_content.get('content') or ""
-                        content = content.replace("\n", " ").strip()
-                       
+                        # Don't strip newlines aggressively to preserve contact formatting
+                        content = content.strip()
+                    
                         results.append({
                             "content": content,
                             "url": hit['_source'].get('url', None)
                         })
             else:
-                # Simple content only
+                # Simple content only but preserve formatting
                 for hit in response['hits']['hits']:
                     score = hit['_score']
                     if score >= threshold:
                         content = hit['_source'].get('content') or ""
-                        content = content.replace("\n", " ").strip()
+                        # Preserve formatting for contact information
+                        content = content.strip()
 
                         results.append({
                             "content": content,
@@ -646,13 +664,14 @@ class QueryProcessor:
             logger.error(f"Error searching Elasticsearch: {str(e)}", exc_info=True)
             raise
 
-    async def _get_chunk_with_adjacent_context(
-            self, 
-            chunk_source: Dict[str, Any], 
-            tenant_id: str
-        ) -> Dict[str, Any]:
+
+    async def _get_chunk_with_adjacent_context_preserve_contacts(
+        self, 
+        chunk_source: Dict[str, Any], 
+        tenant_id: str
+    ) -> Dict[str, Any]:
         """
-        Get chunk content with adjacent context - simplified version
+        Get chunk content with adjacent context - preserves contact information formatting
         """
         try:
             document_id = chunk_source.get('documentId')
@@ -695,19 +714,33 @@ class QueryProcessor:
                             body=adjacent_query
                         )
                         
-                        # Simple context addition
+                        # Smarter context addition that preserves contact information
                         context_parts = [base_content['content']]
                         
                         for hit in adjacent_response['hits']['hits']:
                             pos = hit['_source']['chunkPosition']
                             content = hit['_source']['content']
                             
+                            # Check if this chunk contains contact information patterns
+                            contact_patterns = [
+                                r'@[\w.-]+\.[a-zA-Z]{2,}',  # Email patterns
+                                r'\+?\d{1,3}[-.\s]?\(?\d{3,4}\)?[-.\s]?\d{3,4}[-.\s]?\d{3,6}',  # Phone patterns
+                                r'contact|email|phone|call|reach|support',  # Contact keywords
+                                r'sales@|support@|info@|help@',  # Common email prefixes
+                            ]
+                            
+                            has_contact_info = any(re.search(pattern, content, re.IGNORECASE) for pattern in contact_patterns)
+                            
                             if pos < current_position:
-                                context_parts.insert(0, content[-200:])  # Previous context
+                                # Previous context - take more if it has contact info
+                                context_length = 500 if has_contact_info else 200
+                                context_parts.insert(0, content[-context_length:])
                             elif pos > current_position:
-                                context_parts.append(content[:200])     # Next context
+                                # Next context - take more if it has contact info
+                                context_length = 500 if has_contact_info else 200
+                                context_parts.append(content[:context_length])
                         
-                        # Combine with simple separators
+                        # Combine with separators that preserve readability
                         if len(context_parts) > 1:
                             base_content['content'] = ' ... '.join(context_parts)
                             
@@ -722,7 +755,263 @@ class QueryProcessor:
                 'content': chunk_source.get('content', '')
             }
 
-     
+
+    def _is_question(self, text: str, language_code: str = 'en') -> bool:
+        """
+        Helper method to detect if text is question-like across multiple languages
+        
+        Args:
+            text: Input text to analyze
+            language_code: ISO language code (e.g., 'en', 'es', 'fr', etc.)
+        
+        Returns:
+            bool: True if text appears to be a question
+        """
+        
+        # Question indicators by language
+        question_indicators = {
+            # English
+            'en': ['what', 'how', 'when', 'where', 'why', 'which', 'who', 'whose', 'whom', 
+                'can', 'could', 'will', 'would', 'should', 'do', 'does', 'did', 
+                'is', 'are', 'am', 'was', 'were', 'have', 'has', 'had'],
+            
+            # German
+            'de': ['was', 'wie', 'wann', 'wo', 'warum', 'welche', 'welcher', 'welches', 
+                'wer', 'wen', 'wem', 'wessen', 'kannst', 'kann', 'können', 'könnte', 
+                'könntest', 'ist', 'sind', 'war', 'waren'],
+            
+            # Spanish
+            'es': ['qué', 'que', 'cómo', 'como', 'cuándo', 'cuando', 'dónde', 'donde', 
+                'por qué', 'por que', 'cuál', 'cual', 'cuáles', 'cuales', 'quién', 
+                'quien', 'quiénes', 'quienes', 'puedes', 'puede', 'podemos'],
+            
+            # French
+            'fr': ['que', 'quoi', 'comment', 'quand', 'où', 'ou', 'pourquoi', 'quel', 
+                'quelle', 'quels', 'quelles', 'qui', 'peux', 'peut', 'pouvez', 
+                'pourriez', 'pourrait', 'est-ce que'],
+            
+            # Italian
+            'it': ['che', 'cosa', 'come', 'quando', 'dove', 'perché', 'perche', 'quale', 
+                'quali', 'chi', 'puoi', 'può', 'possiamo', 'potresti', 'potrebbe'],
+            
+            # Portuguese
+            'pt': ['o que', 'que', 'como', 'quando', 'onde', 'por que', 'porque', 'qual', 
+                'quais', 'quem', 'podes', 'pode', 'podemos', 'poderias', 'poderia'],
+            
+            # Dutch
+            'nl': ['wat', 'hoe', 'wanneer', 'waar', 'waarom', 'welke', 'welk', 'wie', 
+                'kun', 'kan', 'kunnen', 'zou', 'zouden'],
+            
+            # Polish
+            'pl': ['co', 'jak', 'kiedy', 'gdzie', 'dlaczego', 'który', 'która', 'które', 
+                'kto', 'czy', 'możesz', 'może', 'możemy'],
+            
+            # Romanian
+            'ro': ['ce', 'cum', 'când', 'unde', 'de ce', 'care', 'cine', 'poți', 'poate', 
+                'putem', 'este', 'sunt'],
+            
+            # Swedish
+            'sv': ['vad', 'hur', 'när', 'var', 'varför', 'vilken', 'vilket', 'vilka', 
+                'vem', 'kan', 'kunde', 'kommer', 'skulle'],
+            
+            # Norwegian
+            'no': ['hva', 'hvordan', 'når', 'hvor', 'hvorfor', 'hvilken', 'hvilket', 
+                'hvilke', 'hvem', 'kan', 'kunne', 'skal', 'ville'],
+            
+            # Danish
+            'da': ['hvad', 'hvordan', 'hvornår', 'hvor', 'hvorfor', 'hvilken', 'hvilket', 
+                'hvilke', 'hvem', 'kan', 'kunne', 'skal', 'ville'],
+            
+            # Finnish
+            'fi': ['mitä', 'miten', 'milloin', 'missä', 'miksi', 'mikä', 'kuka', 
+                'voitko', 'voinko', 'voimmeko', 'onko'],
+            
+            # Hungarian
+            'hu': ['mi', 'mit', 'hogy', 'hogyan', 'mikor', 'hol', 'miért', 'melyik', 
+                'ki', 'kik', 'tud', 'tudod', 'tudja', 'van', 'vannak'],
+            
+            # Czech
+            'cs': ['co', 'jak', 'kdy', 'kde', 'proč', 'který', 'která', 'které', 'kdo', 
+                'můžeš', 'může', 'můžeme', 'je', 'jsou'],
+            
+            # Slovak
+            'sk': ['čo', 'ako', 'kedy', 'kde', 'prečo', 'ktorý', 'ktorá', 'ktoré', 'kto', 
+                'môžeš', 'môže', 'môžeme', 'je', 'sú'],
+            
+            # Slovenian
+            'sl': ['kaj', 'kako', 'kdaj', 'kje', 'zakaj', 'kateri', 'katera', 'katero', 
+                'kdo', 'lahko', 'lahka', 'lahko', 'je', 'so'],
+            
+            # Croatian
+            'hr': ['što', 'kako', 'kada', 'gdje', 'zašto', 'koji', 'koja', 'koje', 'tko', 
+                'možeš', 'može', 'možemo', 'je', 'su'],
+            
+            # Bosnian
+            'bs': ['što', 'kako', 'kada', 'gdje', 'zašto', 'koji', 'koja', 'koje', 'ko', 
+                'možeš', 'može', 'možemo', 'je', 'su'],
+            
+            # Turkish
+            'tr': ['ne', 'nasıl', 'ne zaman', 'nerede', 'neden', 'niçin', 'hangi', 'kim', 
+                'kimi', 'yapabilir', 'edebilir', 'misin', 'mi', 'mı', 'mu', 'mü'],
+            
+            # Russian
+            'ru': ['что', 'как', 'когда', 'где', 'почему', 'какой', 'какая', 'какое', 
+                'какие', 'кто', 'кого', 'кому', 'можешь', 'может', 'можем'],
+            
+            # Ukrainian
+            'uk': ['що', 'як', 'коли', 'де', 'чому', 'який', 'яка', 'яке', 'які', 'хто', 
+                'можеш', 'може', 'можемо'],
+            
+            # Bulgarian
+            'bg': ['какво', 'как', 'кога', 'къде', 'защо', 'който', 'която', 'което', 
+                'кой', 'можеш', 'може', 'можем'],
+            
+            # Macedonian
+            'mk': ['што', 'како', 'кога', 'каде', 'зошто', 'кој', 'која', 'кое', 'кои', 
+                'можеш', 'може', 'можеме'],
+            
+            # Serbian (Cyrillic)
+            'sr-cyr': ['шта', 'како', 'када', 'где', 'зашто', 'који', 'која', 'које', 'ко', 
+                    'можеш', 'може', 'можемо'],
+            
+            # Kazakh
+            'kk': ['не', 'қалай', 'қашан', 'қайда', 'неге', 'қай', 'кім', 'бола аласың', 
+                'бола алады', 'бола аламыз'],
+            
+            # Hindi
+            'hi': ['क्या', 'कैसे', 'कब', 'कहाँ', 'क्यों', 'कौन', 'कौन सा', 'सकते', 
+                'सकती', 'है', 'हैं', 'कर सकते'],
+            
+            # Marathi
+            'mr': ['काय', 'कसे', 'केव्हा', 'कुठे', 'का', 'कोण', 'कोणता', 'शकता', 
+                'शकते', 'आहे', 'आहेत'],
+            
+            # Nepali
+            'ne': ['के', 'कसरी', 'कहिले', 'कहाँ', 'किन', 'को', 'कुन', 'सक्छ', 
+                'सकिन्छ', 'छ', 'छन्'],
+            
+            # Bengali
+            'bn': ['কি', 'কীভাবে', 'কখন', 'কোথায়', 'কেন', 'কে', 'কোন', 'পারো', 
+                'পারে', 'পারি', 'আছে', 'আছেন'],
+            
+            # Punjabi
+            'pa': ['ਕੀ', 'ਕਿਵੇਂ', 'ਕਦੋਂ', 'ਕਿੱਥੇ', 'ਕਿਉਂ', 'ਕੌਣ', 'ਕਿਹੜਾ', 
+                'ਸਕਦੇ', 'ਸਕਦਾ', 'ਹੈ', 'ਹਨ'],
+            
+            # Gujarati
+            'gu': ['શું', 'કેવી રીતે', 'ક્યારે', 'ક્યાં', 'શા માટે', 'કોણ', 'કયું', 
+                'શકો', 'શકે', 'છે', 'છો'],
+            
+            # Sinhala
+            'si': ['මොකක්', 'කොහොමද', 'කවදා', 'කොහේ', 'ඇයි', 'කවුද', 'කොන', 
+                'පුළුවන්', 'පුළුවන්ද', 'ද'],
+            
+            # Tamil
+            'ta': ['என்ன', 'எப்படி', 'எப்போது', 'எங்கே', 'ஏன்', 'யார்', 'எந்த', 
+                'முடியும்', 'முடியுமா', 'ஆ'],
+            
+            # Telugu
+            'te': ['ఏమిటి', 'ఎలా', 'ఎప్పుడు', 'ఎక్కడ', 'ఎందుకు', 'ఎవరు', 'ఏది', 
+                'చెయ్యగలరు', 'చెయ్యవచ్చు', 'ఆ'],
+            
+            # Kannada
+            'kn': ['ಏನು', 'ಹೇಗೆ', 'ಯಾವಾಗ', 'ಎಲ್ಲಿ', 'ಯಾಕೆ', 'ಯಾರು', 'ಯಾವ', 
+                'ಮಾಡಬಹುದು', 'ಆಗಬಹುದು', 'ಆ'],
+            
+            # Malayalam
+            'ml': ['എന്ത്', 'എങ്ങനെ', 'എപ്പോൾ', 'എവിടെ', 'എന്തുകൊണ്ട്', 'ആര്', 
+                'ഏത്', 'കഴിയും', 'കഴിയുമോ', 'ആണോ'],
+            
+            # Arabic
+            'ar': ['ما', 'ماذا', 'كيف', 'متى', 'أين', 'لماذا', 'أي', 'من', 'يمكن', 'هل'],
+            
+            # Persian
+            'fa': ['چه', 'چی', 'چگونه', 'کی', 'کجا', 'چرا', 'کدام', 'کیست', 'میتوان', 
+                'میتوانی', 'آیا'],
+            
+            # Urdu
+            'ur': ['کیا', 'کیسے', 'کب', 'کہاں', 'کیوں', 'کون', 'کونسا', 'سکتے', 
+                'سکتا', 'ہے', 'ہیں'],
+            
+            # Pashto
+            'ps': ['څه', 'څنګه', 'کله', 'چېرته', 'ولې', 'څوک', 'کوم', 'کولی شي', 'دی'],
+            
+            # Hebrew
+            'he': ['מה', 'איך', 'מתי', 'איפה', 'למה', 'מי', 'איזה', 'יכול', 'יכולה', 
+                'האם', 'האים'],
+            
+            # Chinese
+            'zh': ['什么', '怎么', '何时', '哪里', '为什么', '哪个', '哪些', '谁', '能', 
+                '可以', '会', '是否', '吗', '呢'],
+            
+            # Chinese Traditional
+            'zh-tw': ['什麼', '怎麼', '何時', '哪裡', '為什麼', '哪個', '哪些', '誰', '能', 
+                    '可以', '會', '是否', '嗎', '呢'],
+            
+            # Japanese
+            'ja': ['何', 'なに', 'なん', 'どう', 'どうやって', 'いつ', 'どこ', 'なぜ', 
+                'どの', 'だれ', '誰', 'できます', 'ですか', 'ませんか'],
+            
+            # Korean
+            'ko': ['무엇', '뭐', '어떻게', '언제', '어디', '왜', '어느', '누구', '할 수 있', 
+                '습니까', '까요', '인가요'],
+            
+            # Thai
+            'th': ['อะไร', 'ยังไง', 'เมื่อไหร่', 'ที่ไหน', 'ทำไม', 'ใคร', 'อัน ไหน', 
+                'สามารถ', 'ได้ไหม', 'มั้ย'],
+            
+            # Greek
+            'el': ['τι', 'πώς', 'πότε', 'που', 'γιατί', 'ποιος', 'ποια', 'ποιο', 
+                'μπορείς', 'μπορεί', 'είναι'],
+            
+            # Indonesian
+            'id': ['apa', 'bagaimana', 'kapan', 'dimana', 'mengapa', 'siapa', 'mana', 
+                'bisa', 'dapat', 'apakah'],
+            
+            # Malay
+            'ms': ['apa', 'bagaimana', 'bila', 'di mana', 'mengapa', 'siapa', 'mana', 
+                'boleh', 'dapat', 'adakah'],
+            
+            # Vietnamese
+            'vi': ['gì', 'như thế nào', 'khi nào', 'ở đâu', 'tại sao', 'ai', 'cái nào', 
+                'có thể', 'được không', 'phải không'],
+            
+            # Swahili
+            'sw': ['nini', 'vipi', 'lini', 'wapi', 'kwa nini', 'nani', 'gani', 'weza', 
+                'unaweza', 'je'],
+            
+            # Hausa
+            'ha': ['me', 'ta yaya', 'yaushe', 'ina', 'me yasa', 'wane ne', 'wace', 
+                'iya', 'za ka iya', 'ko'],
+            
+            # Igbo
+            'ig': ['gini', 'kedu', 'mgbe', 'ebe', 'gini mere', 'onye', 'nke', 'nwere ike', 
+                'ga-enwe ike', 'ka']
+        }
+        
+        # Universal question marks
+        question_marks = ['?', '？', '؟']  # Latin, Chinese/Japanese, Arabic question marks
+        
+        text_lower = text.lower().strip()
+        
+        # Check for question marks first (most reliable indicator)
+        if any(mark in text for mark in question_marks):
+            return True
+        
+        # Get indicators for the specified language, fallback to English if not found
+        indicators = question_indicators.get(language_code, question_indicators['en'])
+        
+        # Check for question indicators
+        for indicator in indicators:
+            indicator_lower = indicator.lower()
+            # Check if indicator appears at word boundaries
+            if (text_lower.startswith(indicator_lower + ' ') or 
+                text_lower == indicator_lower or
+                ' ' + indicator_lower + ' ' in text_lower or
+                text_lower.endswith(' ' + indicator_lower)):
+                return True
+        
+        return False 
 
     async def generate_embeddings(self, query: str) -> List[float]:
         """Generate embeddings for a list of queries using a thread pool"""
