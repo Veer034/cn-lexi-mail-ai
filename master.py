@@ -139,7 +139,7 @@ class MultilingualMessageProcessor:
                 basic_auth=(ES_CONFIG['username'], ES_CONFIG['password']),
                 verify_certs=ES_CONFIG.get('verify_certs', True),
                 ssl_show_warn=ES_CONFIG.get('ssl_show_warn', True),
-                # ca_certs=ES_CONFIG.get('ca_certs'),  # Add this line
+                ca_certs=ES_CONFIG.get('ca_certs'),  # Add this line
                 retry_on_timeout=True,
                 max_retries=3
             )
