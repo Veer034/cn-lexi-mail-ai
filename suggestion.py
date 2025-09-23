@@ -2,6 +2,7 @@ import json
 import re
 import httpx
 import logging
+import torch
 from typing import List, Dict, Any, Optional
 from config import MISTRAL_CONFIG
 
@@ -12,10 +13,9 @@ logger = get_logger(__name__)
 
 class SuggestionProcessor:
     def __init__(self):
-        """
-        Initialize the SuggestionProcessor
-        """
-        pass
+        """Initialize the SuggestionProcessor"""
+        self.device = 'cuda' if torch.cuda.is_available() and torch.cuda.device_count() > 0 else 'cpu'
+        logger.info(f"SuggestionProcessor using device: {self.device}")
 
     async def extract_suggestions(self, email_content: str, type: str, subType: Optional[str],  language: str = "en") -> List[str]:
         """

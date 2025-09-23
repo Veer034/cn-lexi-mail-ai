@@ -8,7 +8,7 @@ import asyncio
 from typing import List, Dict, Any, Optional
 from response import TicketData
 from config import  ES_CONFIG, MISTRAL_CONFIG
-
+from lang_utils import LangUtil
 
 
 # Configure logging
@@ -25,8 +25,15 @@ class ComplaintProcessor:
             embedding_model: Model for generating embeddings
         """
         self.es_client = es_client
-        self.embedding_model = embedding_model
-        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        # Optimize device detection
+        self.device = 'cuda' if torch.cuda.is_available() and torch.cuda.device_count() > 0 else 'cpu'
+        logger.info(f"ComplaintProcessor using device: {self.device}")
+
+        # Set model to device if provided during init
+        if embedding_model and hasattr(embedding_model, 'to'):
+            self.embedding_model = embedding_model.to(self.device)
+        else:
+            self.embedding_model = embedding_model
         
 
     async def extract_complaints(self, tenant_id: str, email_content: str, language: str, language_code:str) -> Dict:
@@ -666,7 +673,8 @@ Answer using document info only."""
                 tenant_id=tenant_id,
                 top_k=3,  # Get top 3 results as in original function
                 threshold=0.55,  # Cosine similarity threshold
-                metadata_filters=metadata_filters,include_context= True
+                metadata_filters=metadata_filters,include_context= True,
+                language_code=language_code
             )
         
             return search_results
@@ -683,6 +691,7 @@ Answer using document info only."""
         threshold: float = 0.55,
         metadata_filters: Optional[Dict[str, Any]] = None,
         include_context: bool = True,
+        language_code: str = "en",
         original_query: Optional[str] = None
     ) -> List[Dict[str, Any]]:
         """
@@ -700,6 +709,9 @@ Answer using document info only."""
                     else:
                         filter_conditions.append({"term": {f"metadata.{key}": value}})
             
+
+            question = LangUtil._is_question(original_query,language_code)
+
             # Build query - hybrid if we have original text, semantic-only otherwise
             if original_query:
                 # Hybrid search: semantic + keyword (simple version)
@@ -735,7 +747,7 @@ Answer using document info only."""
                                             {"wildcard": {"chunkType": "*faq*"}},
                                             {"match": {"content": original_query}}
                                         ],
-                                        "boost": 1.5 if self._is_question(original_query) else 1.0
+                                        "boost": 1.5 if question else 1.0
                                     }
                                 }
                             ],
@@ -907,10 +919,18 @@ Answer using document info only."""
             raise
 
     def _generate_embeddings_sync_optimized(self, query: str) -> List[float]:
-        """Optimized synchronous embedding generation"""
+        """Optimized synchronous embedding generation with proper device handling"""
         try:
+            # Ensure model is on correct device
+            if hasattr(self.embedding_model, 'to') and self.embedding_model.device != self.device:
+                self.embedding_model = self.embedding_model.to(self.device)
+            
             # Performance optimizations
             with torch.no_grad():  # Disable gradient computation
+                # Set torch device for consistent tensor operations
+                if self.device == 'cuda' and torch.cuda.is_available():
+                    torch.cuda.empty_cache()  # Clear cache before processing
+                
                 embeddings = self.embedding_model.encode(
                     query,
                     show_progress_bar=False,  # Disable progress bar for single queries
@@ -929,7 +949,10 @@ Answer using document info only."""
         except Exception as e:
             logger.error(f"❌ Error in sync embedding generation: {str(e)}")
             raise
-
+        finally:
+            # Clean up GPU memory if using CUDA
+            if self.device == 'cuda' and torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
 
     def estimate_tokens(self,text: str) -> int:

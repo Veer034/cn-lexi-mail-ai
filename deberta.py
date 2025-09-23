@@ -24,27 +24,34 @@ class EmailClassifier:
         self._load_spam_model()
         self._load_type_subtype_model()
     
-    def _load_spam_model(self):
-        """Load the spam classification model"""
+    async def _load_spam_model(self):
+        """Load the spam classification model asynchronously"""
         spam_model_path = './spam_model'
         try:
-            self.spam_tokenizer = DebertaV2Tokenizer.from_pretrained(spam_model_path)
-            self.spam_model = DebertaV2ForSequenceClassification.from_pretrained(spam_model_path)
+            # Load tokenizer in thread pool
+            self.spam_tokenizer = await asyncio.to_thread(
+                DebertaV2Tokenizer.from_pretrained, spam_model_path
+            )
+            # Load model in thread pool
+            self.spam_model = await asyncio.to_thread(
+                DebertaV2ForSequenceClassification.from_pretrained, spam_model_path
+            )
             logger.info("Spam model loaded successfully.")
         except Exception as e:
             logger.error(f"Error loading spam model: {e}")
             sys.exit(1)
     
-    def _load_type_subtype_model(self):
-        """Load the type/subtype classification model and encoders"""
+    async def _load_type_subtype_model(self):
+        """Load the type/subtype classification model and encoders asynchronously"""
         type_subtype_model_path = './final_model'
         try:
             encoder_dir = os.path.join(type_subtype_model_path, 'encoders')
-            logger.info("0")
+            logger.info("Loading type/subtype model asynchronously...")
 
             # Make DefaultDict available to pickle by adding it to the appropriate module
             import sys
             import pickle
+            
             # Get the original module that DefaultDict was defined in
             class _DefaultDictModule:
                 class DefaultDict(dict):
@@ -59,36 +66,79 @@ class EmailClassifier:
             # This might need to be adjusted based on the original module name
             sys.modules['__main__'].DefaultDict = _DefaultDictModule.DefaultDict
 
+            # Load all pickle files asynchronously using thread pool
+            logger.info("Loading model configuration...")
+            model_config = await asyncio.to_thread(
+                self._load_pickle_file, 
+                os.path.join(encoder_dir, 'model_config.pkl')
+            )
 
+            logger.info("Loading department type encoders...")
+            self.department_type_encoders = await asyncio.to_thread(
+                self._load_pickle_file,
+                os.path.join(encoder_dir, 'department_type_encoders.pkl')
+            )
 
-            with open(os.path.join(encoder_dir, 'model_config.pkl'), 'rb') as file:
-                model_config = pickle.load(file)
+            logger.info("Loading department subtype encoders...")
+            self.department_subtype_encoders = await asyncio.to_thread(
+                self._load_pickle_file,
+                os.path.join(encoder_dir, 'department_subtype_encoders.pkl')
+            )
 
-            config = DebertaV2Config.from_pretrained(type_subtype_model_path)
+            logger.info("Loading department subtype hierarchies...")
+            self.department_subtype_hierarchies = await asyncio.to_thread(
+                self._load_pickle_file,
+                os.path.join(encoder_dir, 'department_subtype_hierarchies.pkl')
+            )
+
+            # Load configuration asynchronously
+            logger.info("Loading DeBERTa configuration...")
+            config = await asyncio.to_thread(
+                DebertaV2Config.from_pretrained, 
+                type_subtype_model_path
+            )
+            
+            # Set configuration parameters
             config.max_types = model_config['max_types']
             config.max_subtypes = model_config['max_subtypes']
-   
-            with open(os.path.join(encoder_dir, 'department_type_encoders.pkl'), 'rb') as file:
-                self.department_type_encoders = pickle.load(file)
 
-            with open(os.path.join(encoder_dir, 'department_subtype_encoders.pkl'), 'rb') as file:
-                self.department_subtype_encoders = pickle.load(file)
-
-            with open(os.path.join(encoder_dir, 'department_subtype_hierarchies.pkl'), 'rb') as file:
-                self.department_subtype_hierarchies = pickle.load(file)
-  
-            self.type_subtype_model = self.DebertaV3ForTypeAndDepartmentSubtype.from_pretrained(
+            # Load the custom model asynchronously
+            logger.info("Loading custom DeBERTa model...")
+            self.type_subtype_model = await asyncio.to_thread(
+                self._load_custom_model,
                 type_subtype_model_path,
-                config=config,
-                department_type_encoders=self.department_type_encoders,
-                department_subtype_encoders=self.department_subtype_encoders
+                config,
+                self.department_type_encoders,
+                self.department_subtype_encoders
             )
-            self.type_subtype_tokenizer = DebertaV2Tokenizer.from_pretrained(type_subtype_model_path)
+
+            # Load tokenizer asynchronously
+            logger.info("Loading tokenizer...")
+            self.type_subtype_tokenizer = await asyncio.to_thread(
+                DebertaV2Tokenizer.from_pretrained,
+                type_subtype_model_path
+            )
+
             logger.info("Type/Subtype model and encoders loaded successfully.")
+            
         except Exception as e:
             logger.error(f"Error loading type/subtype model or encoders: {e}")
             sys.exit(1)
-    
+
+    def _load_pickle_file(self, file_path):
+        """Load pickle file synchronously (for use in thread pool)"""
+        import pickle
+        with open(file_path, 'rb') as file:
+            return pickle.load(file)
+
+    def _load_custom_model(self, model_path, config, dept_type_encoders, dept_subtype_encoders):
+        """Load custom DeBERTa model synchronously (for use in thread pool)"""
+        return self.DebertaV3ForTypeAndDepartmentSubtype.from_pretrained(
+            model_path,
+            config=config,
+            department_type_encoders=dept_type_encoders,
+            department_subtype_encoders=dept_subtype_encoders
+        )
     # Define the model class as an inner class
     class DebertaV3ForTypeAndDepartmentSubtype(DebertaV2ForSequenceClassification):
         def __init__(self, config, department_type_encoders, department_subtype_encoders):
@@ -106,18 +156,22 @@ class EmailClassifier:
             subtype_logits = self.subtype_classifier(pooled_output)
             return {'type_logits': type_logits, 'subtype_logits': subtype_logits}
     
-    def classify_spam(self, email: str) -> str:
+    async def classify_spam(self, email: str) -> str:
         """Classify an email as spam or not"""
         try:
-            inputs = self.spam_tokenizer(email, return_tensors="pt", truncation=True, max_length=512)
-            with torch.no_grad():
-                outputs = self.spam_model(**inputs)
-            prediction = torch.argmax(outputs.logits, dim=1).item()
-            logging.info(f" prediction {prediction}")
-            return self.spam_label_map.get(prediction, "unknown")
+            result = await asyncio.to_thread(self._classify_spam_sync, email)
+            return result
         except Exception as e:
             logger.error(f"Error in spam classification: {e}")
             return "unknown"
+
+    def _classify_spam_sync(self, email: str) -> str:
+        """Synchronous spam classification for thread pool"""
+        inputs = self.spam_tokenizer(email, return_tensors="pt", truncation=True, max_length=512)
+        with torch.no_grad():
+            outputs = self.spam_model(**inputs)
+        prediction = torch.argmax(outputs.logits, dim=1).item()
+        return self.spam_label_map.get(prediction, "unknown")
     
     def classify_type_subtype(self, email: str, department: str, subtype_threshold=0.3) -> (str, str):
         """Classify the type and subtype of an email"""

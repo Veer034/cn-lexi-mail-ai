@@ -139,7 +139,7 @@ class MultilingualMessageProcessor:
                 basic_auth=(ES_CONFIG['username'], ES_CONFIG['password']),
                 verify_certs=ES_CONFIG.get('verify_certs', True),
                 ssl_show_warn=ES_CONFIG.get('ssl_show_warn', True),
-                ca_certs=ES_CONFIG.get('ca_certs'),  # Add this line
+                # ca_certs=ES_CONFIG.get('ca_certs'),  # Add this line
                 retry_on_timeout=True,
                 max_retries=3
             )
@@ -152,16 +152,9 @@ class MultilingualMessageProcessor:
             model_name = 'paraphrase-multilingual-mpnet-base-v2'
             # model_path = models_path or os.path.join(os.getcwd(), 'models', 'sentence_transformer')
         
-            try:
-                if model_path:
-                    logger.info(f"Loading model from local path: {model_path}")
-                    self.st_model = SentenceTransformer(model_path)
-                else:
-                    logger.info(f"Loading model {model_name} from Hugging Face")
-                    self.st_model = SentenceTransformer(model_name)
-            except Exception as e:
-                logger.error(f"Error loading sentence transformer model: {e}")
-                raise
+            self.model_path = model_path
+            self.model_name = model_name
+            self.st_model = None  # Will be loaded asynchronously
             
 
             self.categories = self._load_categories()
@@ -210,6 +203,18 @@ class MultilingualMessageProcessor:
             logger.error("=" * 60)
             raise
 
+    async def _initialize_models(self):
+        """Initialize models asynchronously"""
+        try:
+            if self.model_path:
+                logger.info(f"Loading model from local path: {self.model_path}")
+                self.st_model = await asyncio.to_thread(SentenceTransformer, self.model_path)
+            else:
+                logger.info(f"Loading model {self.model_name} from Hugging Face")
+                self.st_model = await asyncio.to_thread(SentenceTransformer, self.model_name)
+        except Exception as e:
+            logger.error(f"Error loading sentence transformer model: {e}")
+            raise
 
     def _signal_handler(self, sig, frame):
         """Handle shutdown signals gracefully"""
@@ -376,7 +381,7 @@ Classify this email strictly into the format:
 
 
 
-    def extract_sender_name_multilingual(email_data, language):
+    async def extract_sender_name_multilingual(self,email_data, language):
         """
         Extract sender name from email supporting multiple languages.
         
@@ -461,7 +466,6 @@ Classify this email strictly into the format:
         try:
             import spacy
             
-            # Map language codes to available spaCy models
             lang_models = {
                 'en': 'en_core_web_sm',
                 'de': 'de_core_news_sm',
@@ -472,30 +476,30 @@ Classify this email strictly into the format:
                 'ru': 'ru_core_news_sm'
             }
             
-            # Use language-specific model if available
             if language in lang_models:
-                nlp = spacy.load(lang_models[language])
-                
-                # Process the text
-                doc = nlp(email_data)
-                
-                # Look for person names in the last few sentences (likely signature area)
-                sentences = list(doc.sents)
-                potential_signature = " ".join([str(sent) for sent in sentences[-3:]])
-                
-                # Find person entities in the potential signature
-                signature_doc = nlp(potential_signature)
-                person_entities = [ent.text for ent in signature_doc.ents if ent.label_ == "PERSON"]
-                
-                if person_entities:
-                    return person_entities[0]  # Return the first person entity found
+                # Run spaCy processing in thread pool
+                result = await asyncio.to_thread(self._process_with_spacy, email_data, lang_models[language])
+                if result:
+                    return result
         except ImportError:
-            print("spaCy not available for NLP-based extraction")
+            logger.debug("spaCy not available for NLP-based extraction")
         except Exception as e:
-            print(f"Error in NLP extraction: {e}")
-        
-        return None
+            logger.debug(f"Error in NLP extraction: {e}")
    
+    def _process_with_spacy(self, email_data, model_name):
+        """Process email data with spaCy in thread pool"""
+        try:
+            import spacy
+            nlp = spacy.load(model_name)
+            doc = nlp(email_data)
+            sentences = list(doc.sents)
+            potential_signature = " ".join([str(sent) for sent in sentences[-3:]])
+            signature_doc = nlp(potential_signature)
+            person_entities = [ent.text for ent in signature_doc.ents if ent.label_ == "PERSON"]
+            return person_entities[0] if person_entities else None
+        except Exception as e:
+            logger.debug(f"spaCy processing error: {e}")
+            return None
 
     async def process_email_message(self, message):
         """Process individual message and store in Elasticsearch with vectors"""
@@ -1053,6 +1057,10 @@ Classify this email strictly into the format:
             if not await self.health_check():
                 logger.error("✗ Health check failed. Cannot start server.")
                 return
+        
+            logger.info("Initializing models...")
+            await self._initialize_models()
+            logger.info("✓ Models initialized successfully")
             
             # Initialize producer
             logger.info("Initializing Kafka producer...")
