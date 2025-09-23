@@ -8,6 +8,7 @@ import httpx
 import logging
 import asyncio
 import signal
+import psutil
 from sentence_transformers import SentenceTransformer
 from elasticsearch import AsyncElasticsearch
 from pydantic import BaseModel, Field
@@ -15,13 +16,16 @@ from typing import List, Dict, Any, Optional
 from confluent_kafka import Consumer, Producer, KafkaError, TopicPartition
 from confluent_kafka.admin import AdminClient, NewTopic
 from config import KAFKA_CONFIG, ES_CONFIG, MISTRAL_CONFIG
-from deberta import EmailClassifier  # Import the function
+from deberta import EmailClassifier
 from lang_utils import LangUtil
 from query import QueryProcessor
 from complaint import ComplaintProcessor
 from suggestion import SuggestionProcessor
-from response import EmailClassificationDto, Advice,Complaint,TicketData
+from response import EmailClassificationDto, Advice, Complaint, TicketData
 from contextvars import ContextVar
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+from enum import Enum
 
 # Configure logging
 from logger_config import get_logger
@@ -29,12 +33,73 @@ logger = get_logger(__name__)
 
 tracking_id_var = ContextVar("X-Tracking-ID", default="NA")
 
+@dataclass
+class SystemConfig:
+    """System configuration based on hardware capabilities"""
+    cpu_cores: int
+    has_gpu: bool
+    max_concurrent_messages: int
+    thread_pool_size: int
+    embedding_batch_size: int
+    kafka_poll_timeout: float
+
+class HardwareDetector:
+    """Detect system capabilities and configure accordingly"""
+    
+    @staticmethod
+    def detect_system_config() -> SystemConfig:
+        """Detect system capabilities and create optimal configuration"""
+        cpu_cores = psutil.cpu_count(logical=False) or 4
+        logical_cores = psutil.cpu_count(logical=True) or 8
+        memory_gb = psutil.virtual_memory().total / (1024**3)
+        
+        # GPU Detection
+        has_gpu = False
+        try:
+            import torch
+            has_gpu = torch.cuda.is_available()
+            if has_gpu:
+                logger.info(f"GPU detected: CUDA available")
+        except ImportError:
+            try:
+                import tensorflow as tf
+                gpus = tf.config.experimental.list_physical_devices('GPU')
+                has_gpu = len(gpus) > 0
+                if has_gpu:
+                    logger.info(f"GPU detected: TensorFlow found {len(gpus)} GPU(s)")
+            except ImportError:
+                logger.info("No GPU libraries available")
+        
+        # Configure based on resources
+        if has_gpu:
+            # GPU available - can handle more concurrent operations
+            max_concurrent = min(logical_cores * 3, 24)
+            thread_pool_size = min(cpu_cores * 2, 12)
+            embedding_batch_size = 32
+            poll_timeout = 0.1
+        else:
+            # CPU only - more conservative settings
+            max_concurrent = min(logical_cores, 16)  # Reduced from 20
+            thread_pool_size = min(cpu_cores * 0.75, 6)  # Reduced from 8
+            embedding_batch_size = 16
+            poll_timeout = 0.05  # Reduced from 0.2
+        
+        config = SystemConfig(
+            cpu_cores=cpu_cores,
+            has_gpu=has_gpu,
+            max_concurrent_messages=max_concurrent,
+            thread_pool_size=thread_pool_size,
+            embedding_batch_size=embedding_batch_size,
+            kafka_poll_timeout=poll_timeout
+        )
+        
+        logger.info(f"System Config - CPU Cores: {cpu_cores}, GPU: {has_gpu}, "
+                   f"Max Concurrent: {max_concurrent}, Thread Pool: {thread_pool_size}")
+        
+        return config
 
 def detect_language(content):
-    """
-    Language detection that works with multiple languages.
-    Falls back to basic detection if langdetect is not available.
-    """
+    """Language detection with fallback"""
     try:
         from langdetect import detect
         return detect(content)
@@ -96,40 +161,58 @@ class MultilingualMessageProcessor:
         logger.info("INITIALIZING MULTILINGUAL MESSAGE PROCESSOR")
         logger.info("=" * 60)
         
+        # Detect system capabilities
+        self.system_config = HardwareDetector.detect_system_config()
+        
         # Log system information
         logger.info(f"Server startup time: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         logger.info(f"Python version: {os.sys.version}")
         logger.info(f"Process ID: {os.getpid()}")
-       
     
         try:
-            # Kafka configuration
+            # Thread pool for CPU-bound operations
+            self.thread_pool = ThreadPoolExecutor(max_workers=self.system_config.thread_pool_size)
+            logger.info(f"Thread pool initialized with {self.system_config.thread_pool_size} workers")
+            
+            # Semaphore to control concurrent message processing
+            self.processing_semaphore = asyncio.Semaphore(self.system_config.max_concurrent_messages)
+            
+            # Track processing messages for graceful shutdown
+            self.active_tasks = set()
+            
+            # Kafka configuration with optimized settings
             logger.info("Loading Kafka configuration...")
             self.consumer_config = {
                 'bootstrap.servers': KAFKA_CONFIG['bootstrap_servers'],
                 'group.id': KAFKA_CONFIG['group_id'],
                 'auto.offset.reset': KAFKA_CONFIG.get('auto_offset_reset', 'earliest'),
-                'enable.auto.commit': True,
+                'enable.auto.commit': False,
                 'session.timeout.ms': 45000,
                 'heartbeat.interval.ms': 15000,
-                'request.timeout.ms': 65000
+                'request.timeout.ms': 65000,
+                'fetch.min.bytes': 1024,
+                'fetch.wait.max.ms': 500
             }
             
             self.producer_config = {
-                'bootstrap.servers': KAFKA_CONFIG['bootstrap_servers']
+                'bootstrap.servers': KAFKA_CONFIG['bootstrap_servers'],
+                'linger.ms': 5,
+                'compression.type': 'snappy',
+                'batch.size': 16384
             }
             
             # Kafka topic
             self.topic = KAFKA_CONFIG['classification_request_topic']
-            logger.info("✓ Kafka configuration loaded successfully")
+            logger.info("Kafka configuration loaded successfully")
 
-            # Initialize HTTP client
+            # Initialize HTTP client with connection pooling
             logger.info("Initializing HTTP client...")
-            self.http_client = httpx.AsyncClient(timeout=30.0)
-            logger.info("✓ HTTP client initialized successfully")
-                
+            self.http_client = httpx.AsyncClient(
+                timeout=30.0,
+                limits=httpx.Limits(max_connections=20, max_keepalive_connections=10)
+            )
+            logger.info("HTTP client initialized successfully")
 
-        
             # Initialize async Elasticsearch client
             logger.info("Initializing Elasticsearch client...")
 
@@ -139,11 +222,13 @@ class MultilingualMessageProcessor:
                 basic_auth=(ES_CONFIG['username'], ES_CONFIG['password']),
                 verify_certs=ES_CONFIG.get('verify_certs', True),
                 ssl_show_warn=ES_CONFIG.get('ssl_show_warn', True),
-                ca_certs=ES_CONFIG.get('ca_certs'),  # Add this line
+                ca_certs=ES_CONFIG.get('ca_certs'),
                 retry_on_timeout=True,
-                max_retries=3
+                max_retries=3,
+                maxsize=20,
+                http_compress=True
             )
-            logger.info("✓ Elasticsearch client initialized successfully")
+            logger.info("Elasticsearch client initialized successfully")
 
             self.MISTRAL_CONFIG = MISTRAL_CONFIG    
 
@@ -171,18 +256,14 @@ class MultilingualMessageProcessor:
                 embedding_model=self.st_model
             )
 
-            self.suggestion_processor = SuggestionProcessor(
-            )
-
+            self.suggestion_processor = SuggestionProcessor()
             self.email_classifier = EmailClassifier()
 
-            
-            # Try to download nltk data for multiple languages
+            # Try to download nltk data
             try:
                 nltk.download('punkt', quiet=True)
             except Exception as e:
                 logger.warning(f"Failed to download NLTK punkt: {str(e)}")
-            
             
             # Initialize shutdown flag
             self.shutdown_requested = False
@@ -190,15 +271,20 @@ class MultilingualMessageProcessor:
             # Setup signal handlers for graceful shutdown
             signal.signal(signal.SIGINT, self._signal_handler)
             signal.signal(signal.SIGTERM, self._signal_handler)
-            logger.info("✓ Signal handlers configured for graceful shutdown")
+            logger.info("Signal handlers configured for graceful shutdown")
+            
+            # Statistics
+            self.processed_count = 0
+            self.failed_count = 0
+            self.concurrent_peak = 0
             
             logger.info("=" * 60)
-            logger.info("✓ MULTILINGUAL MESSAGE PROCESSOR INITIALIZED SUCCESSFULLY")
+            logger.info("MULTILINGUAL MESSAGE PROCESSOR INITIALIZED SUCCESSFULLY")
             logger.info("=" * 60)
 
         except Exception as e:
             logger.error("=" * 60)
-            logger.error("✗ FAILED TO INITIALIZE MULTILINGUAL MESSAGE PROCESSOR")
+            logger.error("FAILED TO INITIALIZE MULTILINGUAL MESSAGE PROCESSOR")
             logger.error(f"Error: {str(e)}")
             logger.error("=" * 60)
             raise
@@ -208,10 +294,19 @@ class MultilingualMessageProcessor:
         try:
             if self.model_path:
                 logger.info(f"Loading model from local path: {self.model_path}")
-                self.st_model = await asyncio.to_thread(SentenceTransformer, self.model_path)
+                self.st_model = await asyncio.get_event_loop().run_in_executor(
+                    self.thread_pool, SentenceTransformer, self.model_path
+                )
             else:
                 logger.info(f"Loading model {self.model_name} from Hugging Face")
-                self.st_model = await asyncio.to_thread(SentenceTransformer, self.model_name)
+                self.st_model = await asyncio.get_event_loop().run_in_executor(
+                    self.thread_pool, SentenceTransformer, self.model_name
+                )
+            
+            # Update processor instances with loaded model
+            self.query_processor.embedding_model = self.st_model
+            self.complaint_processor.embedding_model = self.st_model
+            
         except Exception as e:
             logger.error(f"Error loading sentence transformer model: {e}")
             raise
@@ -221,7 +316,6 @@ class MultilingualMessageProcessor:
         logger.info(f"Received signal {sig}, initiating graceful shutdown...")
         self.shutdown_requested = True
 
-
     def _load_categories(self):
         try:
             with open('classification.json', 'r') as f:
@@ -229,38 +323,40 @@ class MultilingualMessageProcessor:
         except Exception as e:
             logger.error(f"Error loading categories: {str(e)}")
             return []
-        
 
+    async def process_message_with_semaphore(self, msg_data: dict, msg_key: str, msg_headers: dict):
+        """Process single message with concurrency control"""
+        async with self.processing_semaphore:
+            try:
+                # Set tracking ID for this task
+                tracking_id = msg_headers.get('X-Tracking-ID', b'NA')
+                if isinstance(tracking_id, bytes):
+                    tracking_id = tracking_id.decode('utf-8')
+                tracking_id_var.set(str(tracking_id))
+                
+                # Process the message
+                await self.process_email_message(msg_data)
+                self.processed_count += 1
+                
+            except Exception as e:
+                self.failed_count += 1
+                request_id = str(uuid.uuid4())
+                logger.error(f"Error processing message | Request ID: {request_id} | Error: {str(e)}", exc_info=True)
+                await self.send_to_dead_letter_queue(request_id, msg_data, str(e))
 
-    async def publish_classification_to_kafka(self, tenant_id:str, topic: str, classification: EmailClassificationDto):
-        """
-        Publishes a document to a Kafka topic, preserving existing metadata.
-        
-        Args:
-            tenant_id: Tenant identifier
-            topic: Kafka topic to publish to
-            classification: Email classification
-            
-        
-        Returns:
-            Future for the message delivery
-        """
-        
-
+    async def publish_classification_to_kafka(self, tenant_id: str, topic: str, classification: EmailClassificationDto):
+        """Publish classification to Kafka with async handling"""
         # Serialize key and value
-        serialized_key = str(tenant_id).encode("utf-8")  # Convert tenant_id to bytes
-        # Convert Pydantic model to dict first, then to JSON string
-        # Use model_dump() instead of dict() for Pydantic v2 compatibility
+        serialized_key = str(tenant_id).encode("utf-8")
+        
         try:
-            # Try the new Pydantic v2 method first
             data = classification.model_dump()
         except AttributeError:
-            # Fall back to the old method for Pydantic v1
             data = classification.dict()
         
         serialized_classification = json.dumps(data).encode("utf-8")
 
-        # Create an asyncio Future to wait for delivery report
+        # Create future for async delivery
         future = asyncio.Future()
         
         def delivery_callback(err, msg):
@@ -269,16 +365,17 @@ class MultilingualMessageProcessor:
             else:
                 future.set_result(msg)
         
-        # Get current trackingId and ensure it's a string
         tracking_id = tracking_id_var.get() or "NA"
-        if isinstance(tracking_id, bytes):
-            tracking_id_str = tracking_id.decode("utf-8")
-        else:
-            tracking_id_str = str(tracking_id)
+        tracking_id_str = str(tracking_id)
 
-        self.producer.produce(topic, key=serialized_key, value=serialized_classification, callback=delivery_callback,headers=[("X-Tracking-ID", tracking_id_str)])
-        self.producer.poll(1)  # Trigger delivery callbacks
-        self.producer.flush()   # Ensure delivery
+        self.producer.produce(
+            topic, 
+            key=serialized_key, 
+            value=serialized_classification, 
+            callback=delivery_callback,
+            headers=[("X-Tracking-ID", tracking_id_str)]
+        )
+        self.producer.poll(0)  # Non-blocking poll
         
         return await future
 
@@ -300,8 +397,7 @@ class MultilingualMessageProcessor:
             
         except Exception as e:
             logger.error(f"Error processing email: {str(e)}", exc_info=True)
-            return {"error": str(e)}
-
+            return "error", ""
 
     async def _classify_email(self, email_content: str, detected_language: str, department: Optional[str] = None):
         """
@@ -349,16 +445,15 @@ Classify this email strictly into the format:
             "temperature": 0.2
         }
 
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                self.MISTRAL_CONFIG['service_url'],
-                headers={
-                    "Content-Type": "application/json",
-                    "Accept-Charset": "UTF-8"
-                },
-                json=data,
-                timeout=self.MISTRAL_CONFIG['timeout']
-            )
+        response = await self.http_client.post(
+            self.MISTRAL_CONFIG['service_url'],
+            headers={
+                "Content-Type": "application/json",
+                "Accept-Charset": "UTF-8"
+            },
+            json=data,
+            timeout=self.MISTRAL_CONFIG['timeout']
+        )
 
         if response.status_code != 200:
             logger.error(f"Mistral API error: {response.status_code} - {response.text}")
@@ -440,16 +535,8 @@ Classify this email strictly into the format:
             ]
         }
         
-        # Add language-specific patterns first if language is specified
-        if language and language in patterns:
-            specific_patterns = patterns[language]
-        else:
-            specific_patterns = []
-        
-        # Try all patterns - prioritize specific language if known, then try English, then universal
-        all_patterns = specific_patterns + \
-                    ([] if language == 'en' else patterns['en']) + \
-                    patterns['universal']
+        specific_patterns = patterns.get(language, [])
+        all_patterns = specific_patterns + patterns.get('en', []) + patterns['universal']
         
         for pattern in all_patterns:
             try:
@@ -531,7 +618,7 @@ Classify this email strictly into the format:
         suggestion_reply_template = message.get('suggestionReplyTemplate') or ""
         suggestion_regards = message.get('suggestionRegards') or ""
 
-        # Build complete_content intelligently
+        # Build complete_content
         if subject and content:
             complete_content = f"Subject: {subject}, Body: {content}"
         elif subject:
@@ -547,19 +634,24 @@ Classify this email strictly into the format:
             logger.warning(f"Email Message has no content, tenantId: {tenant_id}, threadId: {thread_id}")
             return
 
-        # Step 1: Basic classification - this must succeed or we go to DLQ
+        # Step 1: Basic classification - must succeed or goes to DLQ
         try:
-            language_code = detect_language(content)
+            # Run language detection in thread pool
+            language_code = await asyncio.get_event_loop().run_in_executor(
+                self.thread_pool, detect_language, content
+            )
             
             if not sender_name:
-                sender_name = self.extract_sender_name_multilingual(content, language_code)
+                sender_name = await self.extract_sender_name_multilingual(content, language_code)
                     
             language = LangUtil._get_language_by_code(language_code)
-            logging.info(f"language: {language} department: {department}, complete_content {complete_content}")
 
             # Perform classification
             if language_code == 'en' and department:
-                type, subtype = await self.email_classifier.process_emails(content, department)
+                type, subtype = await asyncio.get_event_loop().run_in_executor(
+                    self.thread_pool, 
+                    lambda: asyncio.run(self.email_classifier.process_emails(content, department))
+                )
             else:
                 type, subtype = await self.categorize_email_using_mistral(complete_content, language, department)
 
@@ -580,7 +672,7 @@ Classify this email strictly into the format:
             subType=''
         )
         
-        # Step 3: Enhanced processing based on type - if this fails, we'll use basic classification
+        # Step 3: Enhanced processing based on type
         enhanced_classification = None
         processing_error = None
         
@@ -593,7 +685,7 @@ Classify this email strictly into the format:
             elif type == "complaint":
                 enhanced_classification = await self._process_complaint_type(
                     tenant_id, thread_id, message_id, sender_name, type, subtype,
-                    complete_content, subject, content, language,language_code, complaint_ai_mode, 
+                    complete_content, subject, content, language, language_code, complaint_ai_mode, 
                     complaint_reply_template, auto_complaint_ticket_generation, complaint_regards
                 )
             elif type == "suggestion":
@@ -614,7 +706,7 @@ Classify this email strictly into the format:
         # Step 4: Use enhanced classification if successful, otherwise use basic
         final_classification = enhanced_classification if enhanced_classification else basic_classification
         
-        # Step 5: Publish the classification (always succeeds with at least basic classification)
+        # Step 5: Publish the classification
         try:
             await self.publish_classification_to_kafka(tenant_id, KAFKA_CONFIG['classification_response_topic'], final_classification)
             
@@ -624,15 +716,12 @@ Classify this email strictly into the format:
                 logger.info(f"Classification published successfully - tenantId: {tenant_id}, threadId: {thread_id}")
                 
         except Exception as e:
-            # Even publishing failed - this is a system error
             logger.error(f"Failed to publish classification - tenantId: {tenant_id}, threadId: {thread_id}, error: {str(e)}", exc_info=True)
-            raise  # Re-raise to trigger DLQ handling
+            raise
 
     async def _process_query_type(self, tenant_id, thread_id, message_id, sender_name, type, subtype,
-                                 complete_content, language, language_code,query_ai_mode, query_reply_template, query_regards):
-        """Process query type emails with enhanced data extraction"""
-        
-        # If query reply generation is not required
+                                 complete_content, language, language_code, query_ai_mode, query_reply_template, query_regards):
+        """Process query type emails"""
         if query_ai_mode in ["no_reply", "template_only"]:
             return EmailClassificationDto(
                 tenantId=tenant_id, 
@@ -643,69 +732,39 @@ Classify this email strictly into the format:
                 subType=subtype
             )
         
-        # Extract all questions from the email and generate responses
         query_response = await self.query_processor.extract_query_generate_responses(
-            tenant_id, 
-            thread_id, 
-            sender_name, 
-            complete_content, 
-            language, 
-            language_code,
-            type, 
-            subtype, 
-            query_ai_mode, 
-            query_reply_template,
-            query_regards
+            tenant_id, thread_id, sender_name, complete_content, language, language_code,
+            type, subtype, query_ai_mode, query_reply_template, query_regards
         )
         
-        # Determine response content
         response_content = None
         if query_response:
             response_content = query_response.get("message", {}).get("content")
-            # Fallback if content is empty or None
             if not response_content:
                 response_content = "No answer found"
         
-        # Create classification with or without response content
         if response_content and response_content != "No answer found":
             return EmailClassificationDto(
-                tenantId=tenant_id, 
-                threadId=thread_id, 
-                messageId=message_id, 
-                senderName=sender_name,
-                type=type, 
-                subType=subtype, 
-                queryResponse=response_content
+                tenantId=tenant_id, threadId=thread_id, messageId=message_id, 
+                senderName=sender_name, type=type, subType=subtype, queryResponse=response_content
             )
         else:
             return EmailClassificationDto(
-                tenantId=tenant_id, 
-                threadId=thread_id, 
-                messageId=message_id, 
-                senderName=sender_name,
-                type=type, 
-                subType=subtype
+                tenantId=tenant_id, threadId=thread_id, messageId=message_id, 
+                senderName=sender_name, type=type, subType=subtype
             )
 
     async def _process_complaint_type(self, tenant_id, thread_id, message_id, sender_name, type, subtype,
-                                    complete_content, subject, content, language,language_code, complaint_ai_mode, 
+                                    complete_content, subject, content, language, language_code, complaint_ai_mode, 
                                     complaint_reply_template, auto_complaint_ticket_generation, complaint_regards):
-        """Process complaint type emails with enhanced data extraction"""
-        
-        # If complaint reply generation is not required
+        """Process complaint type emails"""
         if complaint_ai_mode in ["no_reply"] or complaint_ai_mode in ["template_only"] and not auto_complaint_ticket_generation:
             return EmailClassificationDto(
-                tenantId=tenant_id, 
-                threadId=thread_id, 
-                messageId=message_id, 
-                senderName=sender_name,
-                type=type, 
-                subType=subtype
+                tenantId=tenant_id, threadId=thread_id, messageId=message_id, 
+                senderName=sender_name, type=type, subType=subtype
             )
         
-        # Step 1: Extract complaints and get relevant documents
-        complaint_list = await self.complaint_processor.extract_complaints(tenant_id, complete_content, language,language_code)
-        logger.info(f"complaint_list: {complaint_list}")
+        complaint_list = await self.complaint_processor.extract_complaints(tenant_id, complete_content, language, language_code)
         
         complaint_response_content = None
         
@@ -713,261 +772,108 @@ Classify this email strictly into the format:
             complaints = complaint_list.get('complaints', [])
             advices_data = complaint_list.get('advices', [])
 
-            # Create advice objects from the existing advices
             advices_list = [
-                Advice(
-                    query=advice.get("query", ""), 
-                    advice=advice.get("advice", ""), 
-                    url=advice.get("url", "#")
-                ) 
+                Advice(query=advice.get("query", ""), advice=advice.get("advice", ""), url=advice.get("url", "#")) 
                 for advice in advices_data
             ]
             
-            # Create the complaint object
-            complaint_object = Complaint(
-                complaints=complaints,  
-                advises=advices_list
-            )
+            complaint_object = Complaint(complaints=complaints, advises=advices_list)
             
-            # Step 2: Generate complaint response if AI mode requires it
             if complaint_ai_mode not in ["no_reply", "template_only"]:
-                # Convert advices_data to documents format for response generation
                 documents_for_response = [
-                    {
-                        "content": advice.get("advice", ""),
-                        "url": advice.get("url", "#")
-                    }
+                    {"content": advice.get("advice", ""), "url": advice.get("url", "#")}
                     for advice in advices_data
                 ]
                 
                 complaint_response = await self.complaint_processor.generate_complaint_response(
-                    sender_name=sender_name,
-                    email_content=complete_content,
-                    documents=documents_for_response,
-                    language=language,
-                    template=complaint_reply_template,
-                    complaint_regards=complaint_regards
+                    sender_name=sender_name, email_content=complete_content, documents=documents_for_response,
+                    language=language, template=complaint_reply_template, complaint_regards=complaint_regards
                 )
 
                 if complaint_response:
-                    complaint_response_content = complaint_response  # It's already a string
+                    complaint_response_content = complaint_response
                     if not complaint_response_content or complaint_response_content.strip() == "":
                         complaint_response_content = "No response generated"
                         
-            # Step 3: Generate ticket body if auto ticket generation is enabled
             ticket_data = None
             if auto_complaint_ticket_generation:
                 try:
                     ticket_data = await self.complaint_processor.generate_ticket_data(
-                        sender_name=sender_name,
-                        complaints=complaints,
-                        suggestions=advices_data,
-                        language=language
+                        sender_name=sender_name, complaints=complaints, suggestions=advices_data, language=language
                     )
-                    logger.info(f"Generated ticket data: {ticket_data}")
                 except Exception as e:
                     logger.error(f"Error generating ticket data: {e}")
-                    # Create fallback ticket
-                    ticket_data = TicketData(
-                        title=f"{subject}",
-                        description=f"{content}",
-                        priority="Medium"
-                    )
+                    ticket_data = TicketData(title=f"{subject}", description=f"{content}", priority="Medium")
             
-            # Step 4: Create classification with structured ticket data
             classification_data = {
-                "tenantId": tenant_id,
-                "threadId": thread_id,
-                "messageId": message_id,
-                "senderName": sender_name,
-                "type": type,
-                "subType": subtype,
-                "complaint": complaint_object
+                "tenantId": tenant_id, "threadId": thread_id, "messageId": message_id,
+                "senderName": sender_name, "type": type, "subType": subtype, "complaint": complaint_object
             }
             
-            # Add complaint response if generated
             if complaint_response_content and complaint_response_content != "No response generated":
                 classification_data["complaintResponse"] = complaint_response_content
             
-            # Add structured ticket data if generated
             if ticket_data:
                 classification_data["ticketData"] = ticket_data
 
             return EmailClassificationDto(**classification_data)
             
         else:
-            # No complaints found
             return EmailClassificationDto(
-                tenantId=tenant_id,
-                threadId=thread_id,
-                messageId=message_id,
-                senderName=sender_name,
-                type=type,
-                subType=subtype
+                tenantId=tenant_id, threadId=thread_id, messageId=message_id,
+                senderName=sender_name, type=type, subType=subtype
             )
 
     async def _process_suggestion_type(self, tenant_id, thread_id, message_id, sender_name, type, subtype,
                                      complete_content, language, suggestion_ai_mode, 
                                      suggestion_reply_template, suggestion_regards):
-        """Process suggestion type emails with enhanced data extraction"""
-        
-        # If suggestion reply generation is not required
+        """Process suggestion type emails"""
         if suggestion_ai_mode in ["no_reply", "template_only"]:
             return EmailClassificationDto(
-                tenantId=tenant_id, 
-                threadId=thread_id, 
-                messageId=message_id, 
-                senderName=sender_name,
-                type=type, 
-                subType=subtype
+                tenantId=tenant_id, threadId=thread_id, messageId=message_id, 
+                senderName=sender_name, type=type, subType=subtype
             )
         
-        # Step 1: Extract suggestions (no document search needed)
         suggestions_list = await self.suggestion_processor.extract_suggestions(
-            email_content=complete_content,
-            type=type,
-            subType=subtype,
-            language=language
+            email_content=complete_content, type=type, subType=subtype, language=language
         )
-        logger.info(f"extracted suggestions: {suggestions_list}")
         
         suggestion_response_content = None
         
         if suggestions_list:
-            # Step 2: Generate acknowledgment response if AI mode requires it
             if suggestion_ai_mode not in ["no_reply", "template_only"]:
                 suggestion_response = await self.suggestion_processor.generate_suggestion_response(
-                    sender_name=sender_name,
-                    email_content=complete_content,
-                    suggestions=suggestions_list,  # Pass the suggestions directly
-                    language=language,
-                    template=suggestion_reply_template,
-                    suggestion_regards=suggestion_regards
+                    sender_name=sender_name, email_content=complete_content, suggestions=suggestions_list,
+                    language=language, template=suggestion_reply_template, suggestion_regards=suggestion_regards
                 )
                 
                 if suggestion_response:
-                    # The method now returns a string directly
                     suggestion_response_content = suggestion_response
-                    
-                    # Ensure we have valid content
                     if not suggestion_response_content or suggestion_response_content.strip() == "None":
                         suggestion_response_content = None
             
-            # Step 3: Create classification with suggestions list and optional response
             classification_data = {
-                "tenantId": tenant_id,
-                "threadId": thread_id,
-                "messageId": message_id,
-                "senderName": sender_name,
-                "type": type,
-                "subType": subtype,
-                "suggestions": suggestions_list  # Store as simple list
+                "tenantId": tenant_id, "threadId": thread_id, "messageId": message_id,
+                "senderName": sender_name, "type": type, "subType": subtype, "suggestions": suggestions_list
             }
             
-            # Add suggestion response if generated and valid
             if suggestion_response_content and suggestion_response_content.strip():
                 classification_data["suggestionResponse"] = suggestion_response_content
             
             return EmailClassificationDto(**classification_data)
             
         else:
-            # No suggestions found
             return EmailClassificationDto(
-                tenantId=tenant_id,
-                threadId=thread_id,
-                messageId=message_id,
-                senderName=sender_name,
-                type=type,
-                subType=subtype
+                tenantId=tenant_id, threadId=thread_id, messageId=message_id,
+                senderName=sender_name, type=type, subType=subtype
             )
-
-    async def consume_messages(self):
-        """Consume messages from Kafka"""
-        consumer = Consumer(self.consumer_config)
-        
-        try:
-            # Subscribe to topic
-            consumer.subscribe([self.topic])
-            logger.info(f"✓ Successfully subscribed to Kafka topic: {self.topic}")
-            logger.info("🔄 Starting message consumption loop...")
-            
-            message_count = 0
-            last_heartbeat = datetime.datetime.now()
-            
-            while not self.shutdown_requested:
-                msg = consumer.poll(1.0)
-                
-                # Send periodic heartbeat logs
-                now = datetime.datetime.now()
-                if (now - last_heartbeat).seconds >= 30:  # Every 30 seconds
-                    logger.info(f"💓 Server heartbeat - Status: RUNNING | Messages processed: {message_count}")
-                    last_heartbeat = now
-                
-                if msg is None:
-                    continue
-                
-                if msg.error():
-                    if msg.error().code() == KafkaError._PARTITION_EOF:
-                        logger.debug(f"Reached end of partition {msg.partition()}")
-                    else:
-                        logger.error(f"✗ Kafka consumer error: {msg.error()}")
-                    continue
-                
-                # Process message
-                value = None
-                try:
-                    value = msg.value()
-                    if isinstance(value, bytes):
-                        value = json.loads(value.decode('utf-8'))
-                    elif isinstance(value, str):
-                        value = json.loads(value)
-                    
-                    message_count += 1
-                    tenant_id = value.get('tenantId', 'unknown')
-                    thread_id = value.get('threadId', 'unknown')
-                    
-                    # --- Set the tracking ID from Kafka headers before logging ---
-                    kafka_headers = dict(msg.headers() or [])
-                    tracking_id = kafka_headers.get('X-Tracking-ID', b'NA')
-                    tracking_id_var.set(tracking_id.decode('utf-8') if isinstance(tracking_id, bytes) else str(tracking_id))
-
-                    logger.info(f"📨 Processing message #{message_count} | Tenant: {tenant_id} | Thread: {thread_id}")
-                    
-                    # Process the email message - this now handles graceful degradation internally
-                    await self.process_email_message(value)
-                    
-                    logger.info(f"✅ Successfully processed message #{message_count} for tenant: {tenant_id}")
-                    
-                except Exception as e:
-                    # Only critical failures (like classification failure or publishing failure) reach here
-                    request_id = str(uuid.uuid4())
-                    logger.error(f"✗ Critical error processing message #{message_count} | Request ID: {request_id} | Error: {str(e)}", exc_info=True)
-                    await self.send_to_dead_letter_queue(request_id, value, str(e))
-                    
-        except KeyboardInterrupt:
-            pass
-        finally:
-            # Close the consumer
-            consumer.close()
-
-
-    
-    
-
-    def safe_json_deserializer(self, x):
-        """Safely deserialize JSON, return None if invalid"""
-        try:
-            return json.loads(x.decode("utf-8"))
-        except json.JSONDecodeError as e:
-            logger.error(f"Invalid JSON received: {x}. Error: {e}")
-            return {"raw_message": x.decode("utf-8"), "error": str(e)}
 
     async def send_to_dead_letter_queue(self, request_id, message, error):
         """Send problematic messages to a dead letter topic"""
         error_message = {
             "original_message": message,
             "error": error,
-            "request_id":request_id
+            "request_id": request_id
         }
         
         def delivery_callback(err, msg):
@@ -976,43 +882,59 @@ Classify this email strictly into the format:
             else:
                 logger.info(f"Message sent to classification_request_dlq_topic")
         
-        self.producer.produce(KAFKA_CONFIG['classification_request_dlq_topic'], json.dumps(error_message).encode('utf-8'), callback=delivery_callback)
-        self.producer.poll(1)  # Trigger delivery callbacks
-        self.producer.flush()   # Ensure delivery
+        self.producer.produce(
+            KAFKA_CONFIG['classification_request_dlq_topic'], 
+            json.dumps(error_message).encode('utf-8'), 
+            callback=delivery_callback
+        )
+        self.producer.poll(0)
 
-    async def consume_messages(self):
-        """Consume messages from Kafka"""
+    async def consume_messages_parallel(self):
+        """Consume messages from Kafka with parallel processing"""
         consumer = Consumer(self.consumer_config)
         
         try:
-            # Subscribe to topic
             consumer.subscribe([self.topic])
-            logger.info(f"✓ Successfully subscribed to Kafka topic: {self.topic}")
-            logger.info("🔄 Starting message consumption loop...")
+            logger.info(f"Successfully subscribed to Kafka topic: {self.topic}")
+            logger.info("Starting parallel message consumption loop...")
             
             message_count = 0
             last_heartbeat = datetime.datetime.now()
             
             while not self.shutdown_requested:
-                msg = consumer.poll(1.0)
+                msg = consumer.poll(self.system_config.kafka_poll_timeout)
                 
-                # Send periodic heartbeat logs
+                # Send periodic heartbeat logs with stats
                 now = datetime.datetime.now()
-                if (now - last_heartbeat).seconds >= 30:  # Every 30 seconds
-                    logger.info(f"💓 Server heartbeat - Status: RUNNING | Messages processed: {message_count}")
+                if (now - last_heartbeat).seconds >= 30:
+                    active_count = len(self.active_tasks)
+                    self.concurrent_peak = max(self.concurrent_peak, active_count)
+                    logger.info(f"Server heartbeat - Status: RUNNING | "
+                              f"Processed: {self.processed_count} | Failed: {self.failed_count} | "
+                              f"Active: {active_count} | Peak Concurrent: {self.concurrent_peak}")
                     last_heartbeat = now
                 
                 if msg is None:
+                    # Clean up completed tasks
+                    completed_tasks = [task for task in self.active_tasks if task.done()]
+                    for task in completed_tasks:
+                        self.active_tasks.remove(task)
+                        try:
+                            await task  # Get any exceptions
+                            consumer.commit()  # Commit offset for successful tasks
+                        except Exception as e:
+                            logger.error(f"Task completed with error: {e}")
+                    await asyncio.sleep(0.01)  # Prevent busy waiting
                     continue
                 
                 if msg.error():
                     if msg.error().code() == KafkaError._PARTITION_EOF:
                         logger.debug(f"Reached end of partition {msg.partition()}")
                     else:
-                        logger.error(f"✗ Kafka consumer error: {msg.error()}")
+                        logger.error(f"Kafka consumer error: {msg.error()}")
                     continue
                 
-                # Process message
+                # Process message in parallel
                 try:
                     value = msg.value()
                     if isinstance(value, bytes):
@@ -1024,30 +946,58 @@ Classify this email strictly into the format:
                     tenant_id = value.get('tenantId', 'unknown')
                     thread_id = value.get('threadId', 'unknown')
                     
-                    # --- Set the tracking ID from Kafka headers before logging ---
+                    # Get headers
                     kafka_headers = dict(msg.headers() or [])
-                    tracking_id = kafka_headers.get('X-Tracking-ID', b'NA')
-                    tracking_id_var.set(tracking_id.decode('utf-8') if isinstance(tracking_id, bytes) else str(tracking_id))
-
-                    logger.info(f"📨 Processing message #{message_count} | Tenant: {tenant_id} | Thread: {thread_id}")
                     
-                    await self.process_email_message(value)
+                    logger.info(f"Processing message #{message_count} | Tenant: {tenant_id} | Thread: {thread_id}")
                     
-                    logger.info(f"✅ Successfully processed message #{message_count} for tenant: {tenant_id}")
+                    # Create task for parallel processing
+                    task = asyncio.create_task(
+                        self.process_message_with_semaphore(
+                            value, 
+                            msg.key().decode('utf-8') if msg.key() else str(tenant_id),
+                            kafka_headers
+                        )
+                    )
+                    self.active_tasks.add(task)
+                    
+                    # Clean up completed tasks periodically
+                    if len(self.active_tasks) > self.system_config.max_concurrent_messages * 2:
+                        completed_tasks = [task for task in self.active_tasks if task.done()]
+                        for task in completed_tasks:
+                            self.active_tasks.remove(task)
+                            try:
+                                await task
+                                consumer.commit()  # Commit offset for successful tasks
+                            except Exception as e:
+                                logger.error(f"Task failed: {e}")
                     
                 except Exception as e:
-                    request_id = str(uuid.uuid4())
-                    logger.error(f"✗ Error processing message #{message_count} | Request ID: {request_id} | Error: {str(e)}", exc_info=True)
-                    await self.send_to_dead_letter_queue(request_id, value, str(e))
+                    logger.error(f"Error creating processing task for message #{message_count}: {str(e)}", exc_info=True)
                     
         except KeyboardInterrupt:
-            pass
+            logger.info("Keyboard interrupt received during message consumption")
         finally:
-            # Close the consumer
+            # Wait for all active tasks to complete
+            if self.active_tasks:
+                logger.info(f"Waiting for {len(self.active_tasks)} active tasks to complete...")
+                completed, pending = await asyncio.wait(
+                    self.active_tasks, 
+                    timeout=30.0,  # Give 30 seconds for graceful completion
+                    return_when=asyncio.ALL_COMPLETED
+                )
+                
+                # Cancel any remaining tasks
+                for task in pending:
+                    task.cancel()
+                    
+                logger.info(f"Completed {len(completed)} tasks, cancelled {len(pending)} tasks")
+            
             consumer.close()
+            logger.info("Kafka consumer closed")
 
     async def run(self):
-        """Main processing loop"""
+        """Main processing loop with parallel execution"""
         logger.info("=" * 60)
         logger.info("STARTING MULTILINGUAL MESSAGE PROCESSOR SERVER")
         logger.info("=" * 60)
@@ -1055,32 +1005,34 @@ Classify this email strictly into the format:
         try:
             # Perform health check
             if not await self.health_check():
-                logger.error("✗ Health check failed. Cannot start server.")
+                logger.error("Health check failed. Cannot start server.")
                 return
         
             logger.info("Initializing models...")
             await self._initialize_models()
-            logger.info("✓ Models initialized successfully")
+            logger.info("Models initialized successfully")
             
             # Initialize producer
             logger.info("Initializing Kafka producer...")
             self.producer = Producer(self.producer_config)
-            logger.info("✓ Kafka producer initialized successfully")
+            logger.info("Kafka producer initialized successfully")
             
             logger.info("=" * 60)
-            logger.info("🚀 SERVER STARTED SUCCESSFULLY!")
-            logger.info(f"📧 Listening for messages on topic: {self.topic}")
-            logger.info(f"👥 Consumer group: {self.consumer_config['group.id']}")
-            logger.info(f"🏥 Server status: HEALTHY")
-            logger.info(f"⏰ Server ready at: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            logger.info("SERVER STARTED SUCCESSFULLY!")
+            logger.info(f"Listening for messages on topic: {self.topic}")
+            logger.info(f"Consumer group: {self.consumer_config['group.id']}")
+            logger.info(f"Max concurrent messages: {self.system_config.max_concurrent_messages}")
+            logger.info(f"Thread pool size: {self.system_config.thread_pool_size}")
+            logger.info(f"GPU enabled: {self.system_config.has_gpu}")
+            logger.info(f"Server ready at: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
             logger.info("=" * 60)
             
-            # Start consuming messages
-            await self.consume_messages()
+            # Start consuming messages with parallel processing
+            await self.consume_messages_parallel()
             
         except Exception as e:
             logger.error("=" * 60)
-            logger.error("✗ FATAL ERROR IN MAIN LOOP")
+            logger.error("FATAL ERROR IN MAIN LOOP")
             logger.error(f"Error: {str(e)}")
             logger.error("=" * 60)
             raise
@@ -1095,61 +1047,99 @@ Classify this email strictly into the format:
             # Check Elasticsearch connection
             logger.info("Checking Elasticsearch connection...")
             es_info = await self.es_client.info()
-            logger.info(f"✓ Elasticsearch connection healthy - Version: {es_info['version']['number']}")
+            logger.info(f"Elasticsearch connection healthy - Version: {es_info['version']['number']}")
             
-            # Check Kafka connection by creating a test consumer
+            # Check Kafka connection
             logger.info("Checking Kafka connection...")
             test_consumer = Consumer(self.consumer_config)
             topics = test_consumer.list_topics(timeout=5)
             test_consumer.close()
-            logger.info(f"✓ Kafka connection healthy - Available topics: {len(topics.topics)}")
+            logger.info(f"Kafka connection healthy - Available topics: {len(topics.topics)}")
             
-            logger.info("✓ All health checks passed successfully")
+            logger.info("All health checks passed successfully")
             return True
             
         except Exception as e:
-            logger.error(f"✗ Health check failed: {str(e)}")
+            logger.error(f"Health check failed: {str(e)}")
             return False
 
-
     async def shutdown(self):
-        """Graceful shutdown"""
+        """Graceful shutdown with cleanup"""
         logger.info("=" * 60)
-        logger.info("🛑 INITIATING GRACEFUL SHUTDOWN")
+        logger.info("INITIATING GRACEFUL SHUTDOWN")
         logger.info("=" * 60)
         
         try:
-            # Close the HTTP client
+            # Signal shutdown to stop accepting new messages
+            self.shutdown_requested = True
+            
+            # Wait for active tasks to complete
+            if self.active_tasks:
+                logger.info(f"Waiting for {len(self.active_tasks)} active tasks to complete...")
+                completed, pending = await asyncio.wait(
+                    self.active_tasks, 
+                    timeout=60.0,
+                    return_when=asyncio.ALL_COMPLETED
+                )
+                
+                # Cancel remaining tasks if any
+                for task in pending:
+                    task.cancel()
+                
+                logger.info(f"Completed {len(completed)} tasks, cancelled {len(pending)} tasks")
+            
+            # Close HTTP client
             logger.info("Closing HTTP client...")
             await self.http_client.aclose()
-            logger.info("✓ HTTP client closed successfully")
+            logger.info("HTTP client closed successfully")
             
-            # Close the Elasticsearch client
+            # Close Elasticsearch client
             logger.info("Closing Elasticsearch client...")
             await self.es_client.close()
-            logger.info("✓ Elasticsearch client closed successfully")
+            logger.info("Elasticsearch client closed successfully")
             
-            # Ensure all messages are delivered before shutting down producer
-            logger.info("Flushing Kafka producer...")
+            # Flush Kafka producer
             if hasattr(self, 'producer'):
-                self.producer.flush()
-                logger.info("✓ Kafka producer flushed successfully")
+                logger.info("Flushing Kafka producer...")
+                self.producer.flush(timeout=10)
+                logger.info("Kafka producer flushed successfully")
+            
+            # Shutdown thread pool
+            logger.info("Shutting down thread pool...")
+            self.thread_pool.shutdown(wait=True, timeout=30)
+            logger.info("Thread pool shutdown completed")
+            
+            # Print final statistics
+            logger.info("=" * 40)
+            logger.info("FINAL PROCESSING STATISTICS")
+            logger.info(f"Total messages processed: {self.processed_count}")
+            logger.info(f"Total failures: {self.failed_count}")
+            logger.info(f"Peak concurrent processing: {self.concurrent_peak}")
+            logger.info(f"Success rate: {(self.processed_count / (self.processed_count + self.failed_count) * 100):.2f}%" if (self.processed_count + self.failed_count) > 0 else "N/A")
             
             logger.info("=" * 60)
-            logger.info("✅ GRACEFUL SHUTDOWN COMPLETED")
-            logger.info(f"🕐 Shutdown completed at: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            logger.info("GRACEFUL SHUTDOWN COMPLETED")
+            logger.info(f"Shutdown completed at: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
             logger.info("=" * 60)
             
         except Exception as e:
-            logger.error(f"✗ Error during shutdown: {str(e)}", exc_info=True)
+            logger.error(f"Error during shutdown: {str(e)}", exc_info=True)
 
 
 if __name__ == "__main__":
     logger.info("=" * 80)
-    logger.info("🌟 MULTILINGUAL MESSAGE PROCESSOR - STARTING UP")
+    logger.info("MULTILINGUAL MESSAGE PROCESSOR - STARTING UP")
     logger.info("=" * 80)
     
     try:
+        # Use uvloop for better performance if available
+        try:
+            import uvloop
+            uvloop.install()
+            logger.info("Using uvloop for enhanced performance")
+        except ImportError:
+            logger.info("uvloop not available, using default event loop")
+        
         # Initialize processor
         processor = MultilingualMessageProcessor()
         
@@ -1157,9 +1147,9 @@ if __name__ == "__main__":
         asyncio.run(processor.run())
         
     except KeyboardInterrupt:
-        logger.info("👋 Application terminated by user")
+        logger.info("Application terminated by user")
     except Exception as e:
-        logger.error(f"💥 Application crashed: {str(e)}", exc_info=True)
+        logger.error(f"Application crashed: {str(e)}", exc_info=True)
     finally:
-        logger.info("🏁 Application shutdown complete")
+        logger.info("Application shutdown complete")
         logger.info("=" * 80)
