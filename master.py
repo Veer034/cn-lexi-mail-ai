@@ -225,7 +225,6 @@ class MultilingualMessageProcessor:
                 ca_certs=ES_CONFIG.get('ca_certs'),
                 retry_on_timeout=True,
                 max_retries=3,
-                maxsize=20,
                 http_compress=True
             )
             logger.info("Elasticsearch client initialized successfully")
