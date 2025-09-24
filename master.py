@@ -7,6 +7,9 @@ import nltk
 import httpx
 import logging
 import asyncio
+from asyncio import Semaphore
+import time
+from datetime import datetime, timedelta
 import signal
 import psutil
 from sentence_transformers import SentenceTransformer
@@ -38,10 +41,10 @@ class SystemConfig:
     """System configuration based on hardware capabilities"""
     cpu_cores: int
     has_gpu: bool
-    max_concurrent_messages: int
     thread_pool_size: int
     embedding_batch_size: int
     kafka_poll_timeout: float
+    max_concurrent_messages: int = 3  # Fixed to 3 for simplicity
 
 class HardwareDetector:
     """Detect system capabilities and configure accordingly"""
@@ -61,40 +64,21 @@ class HardwareDetector:
             if has_gpu:
                 logger.info(f"GPU detected: CUDA available")
         except ImportError:
-            try:
-                import tensorflow as tf
-                gpus = tf.config.experimental.list_physical_devices('GPU')
-                has_gpu = len(gpus) > 0
-                if has_gpu:
-                    logger.info(f"GPU detected: TensorFlow found {len(gpus)} GPU(s)")
-            except ImportError:
-                logger.info("No GPU libraries available")
+            logger.info("No GPU libraries available")
         
-        # Configure based on resources
-        if has_gpu:
-            # GPU available - can handle more concurrent operations
-            max_concurrent = min(logical_cores * 3, 24)
-            thread_pool_size = min(cpu_cores * 2, 12)
-            embedding_batch_size = 32
-            poll_timeout = 0.1
-        else:
-            # CPU only - more conservative settings
-            max_concurrent = min(logical_cores, 16)  # Reduced from 20
-            thread_pool_size = min(cpu_cores * 0.75, 6)  # Reduced from 8
-            embedding_batch_size = 16
-            poll_timeout = 0.05  # Reduced from 0.2
-        
+        # Simple configuration - always use 3 parallel messages
         config = SystemConfig(
             cpu_cores=cpu_cores,
             has_gpu=has_gpu,
-            max_concurrent_messages=max_concurrent,
-            thread_pool_size=thread_pool_size,
-            embedding_batch_size=embedding_batch_size,
-            kafka_poll_timeout=poll_timeout
+            max_concurrent_messages=3,  # Fixed to 3
+            thread_pool_size=min(cpu_cores, 6),
+            embedding_batch_size=16,
+            kafka_poll_timeout=0.1
         )
         
-        logger.info(f"System Config - CPU Cores: {cpu_cores}, GPU: {has_gpu}, "
-                   f"Max Concurrent: {max_concurrent}, Thread Pool: {thread_pool_size}")
+        logger.info(f"System Config - CPU Cores: {cpu_cores}, GPU: {has_gpu}")
+        logger.info(f"Max Concurrent Messages: 3 (fixed)")
+        logger.info(f"Thread Pool: {config.thread_pool_size}")
         
         return config
 
@@ -164,8 +148,12 @@ class MultilingualMessageProcessor:
         # Detect system capabilities
         self.system_config = HardwareDetector.detect_system_config()
         
+        logger.info("=" * 60)
+        logger.info("MULTILINGUAL MESSAGE PROCESSOR INITIALIZED SUCCESSFULLY")
+        logger.info("=" * 60)
+
         # Log system information
-        logger.info(f"Server startup time: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        logger.info(f"Server startup time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         logger.info(f"Python version: {os.sys.version}")
         logger.info(f"Process ID: {os.getpid()}")
     
@@ -174,8 +162,8 @@ class MultilingualMessageProcessor:
             self.thread_pool = ThreadPoolExecutor(max_workers=self.system_config.thread_pool_size)
             logger.info(f"Thread pool initialized with {self.system_config.thread_pool_size} workers")
             
-            # Semaphore to control concurrent message processing
-            self.processing_semaphore = asyncio.Semaphore(self.system_config.max_concurrent_messages)
+            # Simple semaphore for exactly 3 concurrent messages
+            self.processing_semaphore = asyncio.Semaphore(3)
             
             # Track processing messages for graceful shutdown
             self.active_tasks = set()
@@ -186,7 +174,8 @@ class MultilingualMessageProcessor:
                 'bootstrap.servers': KAFKA_CONFIG['bootstrap_servers'],
                 'group.id': KAFKA_CONFIG['group_id'],
                 'auto.offset.reset': KAFKA_CONFIG.get('auto_offset_reset', 'earliest'),
-                'enable.auto.commit': False,
+                'enable.auto.commit': True,  # Let Kafka handle commits automatically
+                'auto.commit.interval.ms': 5000,
                 'session.timeout.ms': 45000,
                 'heartbeat.interval.ms': 15000,
                 'request.timeout.ms': 65000,
@@ -208,8 +197,8 @@ class MultilingualMessageProcessor:
             # Initialize HTTP client with connection pooling
             logger.info("Initializing HTTP client...")
             self.http_client = httpx.AsyncClient(
-                timeout=30.0,
-                limits=httpx.Limits(max_connections=20, max_keepalive_connections=10)
+                timeout=120.0,  # Increased timeout for Mistral responses
+                limits=httpx.Limits(max_connections=10, max_keepalive_connections=5)
             )
             logger.info("HTTP client initialized successfully")
 
@@ -222,7 +211,7 @@ class MultilingualMessageProcessor:
                 basic_auth=(ES_CONFIG['username'], ES_CONFIG['password']),
                 verify_certs=ES_CONFIG.get('verify_certs', True),
                 ssl_show_warn=ES_CONFIG.get('ssl_show_warn', True),
-                ca_certs=ES_CONFIG.get('ca_certs'),
+                # ca_certs=ES_CONFIG.get('ca_certs'),
                 retry_on_timeout=True,
                 max_retries=3,
                 http_compress=True
@@ -231,20 +220,15 @@ class MultilingualMessageProcessor:
 
             self.MISTRAL_CONFIG = MISTRAL_CONFIG    
 
-
             # Initialize SentenceTransformer with multilingual model
             model_name = 'paraphrase-multilingual-mpnet-base-v2'
-            # model_path = models_path or os.path.join(os.getcwd(), 'models', 'sentence_transformer')
-        
             self.model_path = model_path
             self.model_name = model_name
             self.st_model = None  # Will be loaded asynchronously
             
-
             self.categories = self._load_categories()
             
-
-            # Create EmailProcessor instance
+            # Create processor instances
             self.query_processor = QueryProcessor(
                 es_client=self.es_client,
                 embedding_model=self.st_model
@@ -277,10 +261,6 @@ class MultilingualMessageProcessor:
             self.failed_count = 0
             self.concurrent_peak = 0
             
-            logger.info("=" * 60)
-            logger.info("MULTILINGUAL MESSAGE PROCESSOR INITIALIZED SUCCESSFULLY")
-            logger.info("=" * 60)
-
         except Exception as e:
             logger.error("=" * 60)
             logger.error("FAILED TO INITIALIZE MULTILINGUAL MESSAGE PROCESSOR")
@@ -324,7 +304,7 @@ class MultilingualMessageProcessor:
             return []
 
     async def process_message_with_semaphore(self, msg_data: dict, msg_key: str, msg_headers: dict):
-        """Process single message with concurrency control"""
+        """Process single message with concurrency control (max 3)"""
         async with self.processing_semaphore:
             try:
                 # Set tracking ID for this task
@@ -374,34 +354,31 @@ class MultilingualMessageProcessor:
             callback=delivery_callback,
             headers=[("X-Tracking-ID", tracking_id_str)]
         )
-        self.producer.poll(0)  # Non-blocking poll
+        self.producer.poll(0)
         
         return await future
 
-    async def categorize_email_using_mistral(self, email_content: str, language: str,  department: Optional[str] = None) -> Dict[str, str]:
-        """
-        Process an email with a balanced approach:
-        1. First classify the email type/subtype
-        2. If it's a query, extract the question in a separate call
-        3. Retrieve relevant documents and generate response if needed
-        """
+    async def categorize_email_using_mistral(self, email_content: str, language: str, department: Optional[str] = None) -> tuple[str, str]:
+        """Simple Mistral classification without rate limiting"""
         try:
-            # Step 1: Classify the email
-            classification = await self._classify_email(email_content,language, department)
+            logger.debug(f"Making Mistral request for classification")
+            
+            classification = await self._classify_email_with_timeout(email_content, language, department)
             
             email_type = classification.get("type")
             email_subtype = classification.get("subtype", "")
-        
-            return  email_type, email_subtype
             
-        except Exception as e:
-            logger.error(f"Error processing email: {str(e)}", exc_info=True)
+            return email_type, email_subtype
+            
+        except asyncio.TimeoutError:
+            logger.error("Mistral request timeout")
             return "error", ""
-
-    async def _classify_email(self, email_content: str, detected_language: str, department: Optional[str] = None):
-        """
-        Classify email into type and subtype using Mistral.
-        """
+        except Exception as e:
+            logger.error(f"Mistral request error: {str(e)}")
+            return "error", ""
+    
+    async def _classify_email_with_timeout(self, email_content: str, detected_language: str, department: Optional[str] = None):
+        """Classification with timeout for slow responses"""
         department_str = ""
         if department:
             department_data = next((item for item in self.categories if item["sector"] == department), None)
@@ -443,7 +420,8 @@ Classify this email strictly into the format:
             "max_tokens": 250,
             "temperature": 0.2
         }
-
+        
+        # Use longer timeout for Mistral
         response = await self.http_client.post(
             self.MISTRAL_CONFIG['service_url'],
             headers={
@@ -473,23 +451,10 @@ Classify this email strictly into the format:
             logger.error(f"Error parsing Mistral response: {e}")
             return {"type": "error", "subtype": ""}
 
-
-
-    async def extract_sender_name_multilingual(self,email_data, language):
-        """
-        Extract sender name from email supporting multiple languages.
+    async def extract_sender_name_multilingual(self, email_data, language):
+        """Extract sender name from email supporting multiple languages."""
         
-        Args:
-            email_data: Raw email or email body text
-            language:  language code to assist in extraction
-        
-        Returns:
-            str: Extracted sender name or None if not found
-        """
-   
-
-        
-        # 1. Try signature patterns based on common formats across languages
+        # Language-specific patterns
         patterns = {
             'en': [
                 r'(?:Best|Kind|Warm)?\s*(?:regards|wishes),\s*([^\n\r,\.]{2,50})',
@@ -589,7 +554,7 @@ Classify this email strictly into the format:
 
     async def process_email_message(self, message):
         """Process individual message and store in Elasticsearch with vectors"""
-        logger.info(f"Message complete: {message}")
+        logger.info(f"Processing message: {message.get('tenantId')}/{message.get('threadId')}")
 
         tenant_id = message.get('tenantId')
         thread_id = message.get('threadId')
@@ -600,9 +565,8 @@ Classify this email strictly into the format:
         # Extract text content from message
         content = message.get('emailBody') or ""
         subject = message.get('subject') or ""
-        # After cleaning (empty strings remain empty)
-        content = content.replace('\n', ' ').replace('\r', ' ')  # "" stays ""
-        subject = subject.replace('\n', ' ').replace('\r', ' ')  # "" stays ""
+        content = content.replace('\n', ' ').replace('\r', ' ')
+        subject = subject.replace('\n', ' ').replace('\r', ' ')
         
         query_ai_mode = message.get('queryAIMode') or ""
         query_reply_template = message.get('queryReplyTemplate') or ""
@@ -654,14 +618,13 @@ Classify this email strictly into the format:
             else:
                 type, subtype = await self.categorize_email_using_mistral(complete_content, language, department)
 
-            logger.info(f"Email Type: {type}, SubType: {subtype}")
+            logger.info(f"Email classified as: {type}, SubType: {subtype}")
             
         except Exception as e:
-            # Classification failed - this should go to DLQ
             logger.error(f"Classification failed for message - tenantId: {tenant_id}, threadId: {thread_id}, error: {str(e)}", exc_info=True)
-            raise  # Re-raise to trigger DLQ handling
+            raise
         
-        # Step 2: Create basic classification object (fallback in case of processing errors)
+        # Create basic classification object
         basic_classification = EmailClassificationDto(
             tenantId=tenant_id, 
             threadId=thread_id, 
@@ -718,6 +681,7 @@ Classify this email strictly into the format:
             logger.error(f"Failed to publish classification - tenantId: {tenant_id}, threadId: {thread_id}, error: {str(e)}", exc_info=True)
             raise
 
+    # Keep all the existing _process_*_type methods unchanged
     async def _process_query_type(self, tenant_id, thread_id, message_id, sender_name, type, subtype,
                                  complete_content, language, language_code, query_ai_mode, query_reply_template, query_regards):
         """Process query type emails"""
@@ -898,13 +862,13 @@ Classify this email strictly into the format:
             logger.info("Starting parallel message consumption loop...")
             
             message_count = 0
-            last_heartbeat = datetime.datetime.now()
+            last_heartbeat = datetime.now()
             
             while not self.shutdown_requested:
                 msg = consumer.poll(self.system_config.kafka_poll_timeout)
                 
                 # Send periodic heartbeat logs with stats
-                now = datetime.datetime.now()
+                now = datetime.now()
                 if (now - last_heartbeat).seconds >= 30:
                     active_count = len(self.active_tasks)
                     self.concurrent_peak = max(self.concurrent_peak, active_count)
@@ -1023,7 +987,7 @@ Classify this email strictly into the format:
             logger.info(f"Max concurrent messages: {self.system_config.max_concurrent_messages}")
             logger.info(f"Thread pool size: {self.system_config.thread_pool_size}")
             logger.info(f"GPU enabled: {self.system_config.has_gpu}")
-            logger.info(f"Server ready at: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            logger.info(f"Server ready at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
             logger.info("=" * 60)
             
             # Start consuming messages with parallel processing
@@ -1118,7 +1082,7 @@ Classify this email strictly into the format:
             
             logger.info("=" * 60)
             logger.info("GRACEFUL SHUTDOWN COMPLETED")
-            logger.info(f"Shutdown completed at: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            logger.info(f"Shutdown completed at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
             logger.info("=" * 60)
             
         except Exception as e:
