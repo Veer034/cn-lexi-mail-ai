@@ -3,6 +3,7 @@ from transformers import DebertaV2Tokenizer, DebertaV2ForSequenceClassification,
 import os
 import logging
 import sys
+import asyncio  # ADD THIS IMPORT
 
 # Configure logging
 from logger_config import get_logger
@@ -20,9 +21,13 @@ class EmailClassifier:
         self.department_subtype_encoders = None
         self.department_subtype_hierarchies = None
         
-        # Initialize models
-        self._load_spam_model()
-        self._load_type_subtype_model()
+        # DON'T initialize models here - they're async!
+        # Models will be loaded via async initialize() method
+    
+    async def initialize(self):
+        """Initialize models asynchronously - call this after creating the instance"""
+        await self._load_spam_model()
+        await self._load_type_subtype_model()
     
     async def _load_spam_model(self):
         """Load the spam classification model asynchronously"""
@@ -49,7 +54,6 @@ class EmailClassifier:
             logger.info("Loading type/subtype model asynchronously...")
 
             # Make DefaultDict available to pickle by adding it to the appropriate module
-            import sys
             import pickle
             
             # Get the original module that DefaultDict was defined in
@@ -63,7 +67,6 @@ class EmailClassifier:
                         self[item] = set()
             
             # Add the class to the module pickle is looking for
-            # This might need to be adjusted based on the original module name
             sys.modules['__main__'].DefaultDict = _DefaultDictModule.DefaultDict
 
             # Load all pickle files asynchronously using thread pool
@@ -139,6 +142,7 @@ class EmailClassifier:
             department_type_encoders=dept_type_encoders,
             department_subtype_encoders=dept_subtype_encoders
         )
+    
     # Define the model class as an inner class
     class DebertaV3ForTypeAndDepartmentSubtype(DebertaV2ForSequenceClassification):
         def __init__(self, config, department_type_encoders, department_subtype_encoders):
@@ -173,52 +177,73 @@ class EmailClassifier:
         prediction = torch.argmax(outputs.logits, dim=1).item()
         return self.spam_label_map.get(prediction, "unknown")
     
-    def classify_type_subtype(self, email: str, department: str, subtype_threshold=0.3) -> (str, str):
-        """Classify the type and subtype of an email"""
+    async def classify_type_subtype(self, email: str, department: str, subtype_threshold=0.3) -> tuple:
+        """Classify the type and subtype of an email asynchronously"""
         try:
-            input_text = f"{department} [SEP] {email}"
-            inputs = self.type_subtype_tokenizer(input_text, return_tensors="pt", truncation=True, max_length=512)
-            with torch.no_grad():
-                outputs = self.type_subtype_model(**inputs)
-            type_logits = outputs['type_logits']
-            subtype_logits = outputs['subtype_logits']
-
-            dept_type_encoder = self.department_type_encoders[department]
-            dept_subtype_encoder = self.department_subtype_encoders[department]
-
-            valid_type_count = len(dept_type_encoder.classes_)
-            valid_subtype_count = len(dept_subtype_encoder.classes_)
-
-            type_probs = torch.nn.functional.softmax(type_logits[0, :valid_type_count], dim=0)
-            subtype_probs = torch.nn.functional.softmax(subtype_logits[0, :valid_subtype_count], dim=0)
-
-            predicted_type = dept_type_encoder.inverse_transform([torch.argmax(type_probs).item()])[0]
-            max_subtype_prob = torch.max(subtype_probs).item()
-            predicted_subtype = None
-
-            if max_subtype_prob >= subtype_threshold:
-                predicted_subtype = dept_subtype_encoder.inverse_transform([torch.argmax(subtype_probs).item()])[0]
-                valid_subtypes = self.department_subtype_hierarchies[department][predicted_type]
-                if predicted_subtype not in valid_subtypes:
-                    predicted_subtype = None
-
-            return predicted_type, predicted_subtype
+            result = await asyncio.to_thread(
+                self._classify_type_subtype_sync, 
+                email, 
+                department, 
+                subtype_threshold
+            )
+            return result
         except Exception as e:
             logger.error(f"Error in type/subtype classification: {e}")
             return "unknown", None
     
+    def _classify_type_subtype_sync(self, email: str, department: str, subtype_threshold=0.3) -> tuple:
+        """Synchronous type/subtype classification for thread pool"""
+        input_text = f"{department} [SEP] {email}"
+        inputs = self.type_subtype_tokenizer(input_text, return_tensors="pt", truncation=True, max_length=512)
+        with torch.no_grad():
+            outputs = self.type_subtype_model(**inputs)
+        type_logits = outputs['type_logits']
+        subtype_logits = outputs['subtype_logits']
+
+        dept_type_encoder = self.department_type_encoders[department]
+        dept_subtype_encoder = self.department_subtype_encoders[department]
+
+        valid_type_count = len(dept_type_encoder.classes_)
+        valid_subtype_count = len(dept_subtype_encoder.classes_)
+
+        type_probs = torch.nn.functional.softmax(type_logits[0, :valid_type_count], dim=0)
+        subtype_probs = torch.nn.functional.softmax(subtype_logits[0, :valid_subtype_count], dim=0)
+
+        predicted_type = dept_type_encoder.inverse_transform([torch.argmax(type_probs).item()])[0]
+        max_subtype_prob = torch.max(subtype_probs).item()
+        predicted_subtype = None
+
+        if max_subtype_prob >= subtype_threshold:
+            predicted_subtype = dept_subtype_encoder.inverse_transform([torch.argmax(subtype_probs).item()])[0]
+            valid_subtypes = self.department_subtype_hierarchies[department][predicted_type]
+            if predicted_subtype not in valid_subtypes:
+                predicted_subtype = None
+
+        return predicted_type, predicted_subtype
+    
     async def process_emails(self, complete_content, department):
         """Process an email to determine its type and subtype"""
         try:
-            logger.info(f"Processing email: {complete_content}")
-            label = self.classify_spam(complete_content)
+            logger.debug(f"Starting email classification for content length: {len(complete_content)}")
+            
+            # Check if models are loaded
+            if self.spam_model is None or self.type_subtype_model is None:
+                logger.error("Models not initialized! Call initialize() first.")
+                return "unknown", None
+            
+            logger.debug("Classifying spam...")
+            label = await self.classify_spam(complete_content)
+            logger.info(f"Spam classification result: {label}")
+            
             if label in ["spam"]:
                 type_result = label
                 subtype_result = ""
             else:
-                type_result, subtype_result = self.classify_type_subtype(complete_content, department)
+                logger.debug(f"Classifying type/subtype for department: {department}")
+                type_result, subtype_result = await self.classify_type_subtype(complete_content, department)
+                logger.info(f"Type/Subtype classification result: {type_result}, {subtype_result}")
             
             return type_result, subtype_result
         except Exception as e:
-            logger.error(f"Error processing email: {e}")
+            logger.error(f"Error processing email: {e}", exc_info=True)
             return "unknown", None

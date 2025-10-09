@@ -271,6 +271,7 @@ class MultilingualMessageProcessor:
     async def _initialize_models(self):
         """Initialize models asynchronously"""
         try:
+            # Load sentence transformer model
             if self.model_path:
                 logger.info(f"Loading model from local path: {self.model_path}")
                 self.st_model = await asyncio.get_event_loop().run_in_executor(
@@ -286,9 +287,15 @@ class MultilingualMessageProcessor:
             self.query_processor.embedding_model = self.st_model
             self.complaint_processor.embedding_model = self.st_model
             
+            # *** ADD THIS: Initialize email classifier ***
+            logger.info("Initializing email classifier models...")
+            await self.email_classifier.initialize()
+            logger.info("Email classifier initialized successfully")
+            
         except Exception as e:
-            logger.error(f"Error loading sentence transformer model: {e}")
+            logger.error(f"Error loading models: {e}")
             raise
+
 
     def _signal_handler(self, sig, frame):
         """Handle shutdown signals gracefully"""
@@ -611,12 +618,13 @@ Classify this email strictly into the format:
 
             # Perform classification
             if language_code == 'en' and department:
-                type, subtype = await asyncio.get_event_loop().run_in_executor(
-                    self.thread_pool, 
-                    lambda: asyncio.run(self.email_classifier.process_emails(content, department))
-                )
+                logger.debug(f"Using DeBERTa classifier for English email, department: {department}")
+                type, subtype = await self.email_classifier.process_emails(content, department)
+                logger.debug(f"DeBERTa classification complete: {type}, {subtype}")
             else:
+                logger.debug(f"Using Mistral classifier for {language_code} email")
                 type, subtype = await self.categorize_email_using_mistral(complete_content, language, department)
+                logger.debug(f"Mistral classification complete: {type}, {subtype}")
 
             logger.info(f"Email classified as: {type}, SubType: {subtype}")
             
